@@ -57,6 +57,7 @@ python final_stock.py
 | `.backtest()` | 메서드 | RSI 기반 단순 전략 과거 수익률 계산 |
 | `.calculate_performance_metrics()` | 메서드 | Sharpe Ratio, MDD(최대 낙폭) 계산 |
 | `.predict_multi_step()` | 메서드 | StandardScaler + LSTM으로 3-step 가격 예측 |
+| `.predict_tabpfn()` | 메서드 | Google TabPFNRegressor로 T+1/T+4/T+7 종가 예측 |
 | `.visualize_shap()` | 메서드 | 피처 중요도 수평 막대 차트 저장 |
 | `.run()` | 메서드 | 단독 실행용 — V3 분석 리포트 콘솔 출력 |
 | `.run_and_return()` | 메서드 | llm_stock.py 연동용 — 분석 결과를 딕셔너리로 반환 |
@@ -83,10 +84,94 @@ self.tickers = {
 📈 전략 수익률: 18.42% | Sharpe: 1.23 | MDD: -22.51%
 📰 뉴스 심리: 긍정 (Score: 0.41)
       1. Nvidia's AI chip dominance continues in Q2...
-🔮 AI 가격 예보: [내일] 132,100 | [4일뒤] 133,800 | [7일뒤] 135,200
+🔮 [LSTM]   예보: [내일] 132,100 | [4일뒤] 133,800 | [7일뒤] 135,200
+🔮 [TabPFN] 예보: [내일] 131,850 | [4일뒤] 134,200 | [7일뒤] 136,900
+   📐 모델 차이(T+1): -250 (LSTM 높음)
 🔍 시각화 완료: shap_analysis_엔비디아.png
 =================================================================
 ```
+
+---
+
+## 🧠 모델별 전처리 방식 비교
+
+> `ml_stock.py` 내 LSTM과 TabPFN 두 모델이 동일한 원시 데이터를 서로 다른 방식으로 전처리합니다.
+
+---
+
+### 🔷 LSTM 전처리 (`predict_multi_step`)
+
+| 단계 | 처리 내용 |
+|------|----------|
+| **입력 피처** | `Close`, `USD_KRW`, `SOX_Index` (3개 수치형 컬럼) |
+| **정규화** | `StandardScaler` — 평균 0, 표준편차 1로 Z-score 정규화 |
+| **시퀀스 구성** | `look_back = 20` — 과거 20일을 하나의 시퀀스로 묶음 |
+| **레이블(y)** | 스케일링된 상태의 Close 값 (T+1, T+4, T+7) |
+| **역변환** | 예측값을 `scaler.inverse_transform()`으로 원래 가격 단위로 복원 |
+| **데이터 분할** | 별도 train/test 분리 없음 — 전체 시퀀스로 학습 후 마지막 윈도우로 예측 |
+
+```python
+# LSTM 전처리 핵심 코드 (ml_stock.py: predict_multi_step)
+data   = df[['Close', 'USD_KRW', 'SOX_Index']].values
+scaler = StandardScaler()
+scaled = scaler.fit_transform(data)          # Z-score 정규화
+
+# 과거 20일 → 다음 1/4/7일 Close 예측
+for i in range(len(scaled) - seq_len - 7):
+    X.append(scaled[i:i + seq_len])         # (20, 3) 시퀀스
+    y.append([scaled[i+seq_len, 0],         # T+1
+              scaled[i+seq_len+3, 0],       # T+4
+              scaled[i+seq_len+6, 0]])      # T+7
+```
+
+**특징**: 시계열 순서(temporal order)를 보존하는 슬라이딩 윈도우 + 명시적 스케일링. LSTM이 시계열 패턴을 학습하도록 수동 정규화가 필수입니다.
+
+---
+
+### 🔶 TabPFN 전처리 (`predict_tabpfn`)
+
+| 단계 | 처리 내용 |
+|------|----------|
+| **입력 피처** | `Close`, `USD_KRW`, `SOX_Index`, `RSI`, `EMA20`, `Volume` (6개 컬럼) |
+| **기술적 지표 계산** | `EMA20 = ta.ema(Close, 20)`, `RSI = ta.rsi(Close, 14)` 추가 |
+| **정규화** | ❌ 없음 — TabPFN 내부 자동 처리 |
+| **시퀀스 구성** | `look_back = 10` — 과거 10일 피처를 `flatten()` 하여 1D 벡터로 변환 |
+| **레이블(y)** | 원시 Close 가격 (역변환 불필요) |
+| **데이터 제한** | 최근 `MAX_TRAIN = 1000`개 샘플만 학습 (TabPFN 권장 제한) |
+| **재귀 예측** | T+4, T+7은 T+1 예측값을 윈도우에 롤링하여 순차 추정 |
+
+```python
+# TabPFN 전처리 핵심 코드 (ml_stock.py: predict_tabpfn)
+tdf['EMA20'] = ta.ema(tdf['Close'], length=20)   # 기술적 지표 추가
+tdf['RSI']   = ta.rsi(tdf['Close'], length=14)
+
+# 슬라이딩 윈도우 → 2D 테이블 (TabPFN은 테이블 입력)
+for i in range(look_back, len(tdf) - 1):
+    window = tdf[feat_cols].iloc[i-10:i].values.flatten()  # (10×6,) = 60 피처
+    X.append(window)
+    y.append(float(tdf['Close'].iloc[i]))   # 원시 가격 그대로
+
+# 정규화 없이 바로 fit
+reg = TabPFNRegressor()
+reg.fit(X_train, y_train)   # TabPFN 내부에서 자동 전처리
+```
+
+**특징**: TabPFN은 내부적으로 다중 랜덤 전처리 앙상블(결측치 처리, 스케일링, 인코딩)을 자동 적용합니다. 사용자가 수동으로 스케일링하면 오히려 성능이 저하될 수 있습니다.
+
+---
+
+### ⚖️ 두 모델 전처리 비교 요약
+
+| 항목 | LSTM | TabPFN (Google PriorLabs) |
+|------|------|---------------------------|
+| **정규화** | `StandardScaler` (수동, 필수) | 내부 자동 앙상블 전처리 |
+| **입력 피처 수** | 3개 | 6개 (기술적 지표 포함) |
+| **시퀀스 길이** | 20일 | 10일 (flatten 후 60차원) |
+| **입력 형태** | 3D Tensor `(batch, 20, 3)` | 2D 배열 `(N, 60)` |
+| **레이블 스케일** | 정규화된 값 (역변환 필요) | 원시 가격 (역변환 불필요) |
+| **재귀 예측** | 단일 모델 3출력 | Close 롤링 후 순차 재예측 |
+| **학습 데이터 제한** | 없음 (전체) | 최근 1000개 |
+| **GPU 효과** | 매우 큼 (학습 50 epoch) | 큼 (Transformer 추론) |
 
 ---
 
@@ -207,7 +292,8 @@ MY_MAIN_SERVER_IP = 본체 ip 서버 주소 ipv4 # ← 본체 서버 IP 입력
 |------|-----------|
 | **데이터 수집** | `yfinance`, `feedparser`, `requests` |
 | **데이터 처리** | `pandas`, `numpy`, `pandas_ta` |
-| **ML 모델** | `torch` (PyTorch LSTM), `sklearn` (StandardScaler) |
+| **ML 모델 (시계열)** | `torch` (PyTorch LSTM), `sklearn` (StandardScaler) |
+| **ML 모델 (테이블)** | `tabpfn` (Google PriorLabs — TabPFNRegressor) |
 | **NLP 감성분석** | `transformers` (FinBERT, KoELECTRA) |
 | **LLM 연동** | `requests` → Ollama API (`gemma4:12b`) |
 | **시각화** | `matplotlib` |
@@ -219,11 +305,19 @@ MY_MAIN_SERVER_IP = 본체 ip 서버 주소 ipv4 # ← 본체 서버 IP 입력
 
 ```bash
 pip install yfinance pandas pandas_ta numpy feedparser \
-            transformers torch scikit-learn matplotlib requests
+            transformers torch scikit-learn matplotlib requests \
+            tabpfn
 ```
 
 > **GPU 사용 시**: PyTorch CUDA 버전을 별도 설치하세요.
 > [https://pytorch.org/get-started/locally/](https://pytorch.org/get-started/locally/)
+
+> **TabPFN API 키**: `tabpfn_api.txt` 파일에 아래 형식으로 저장하세요.
+> ```
+> tabpfn_api = "tabpfn_sk_xxxx"
+> hf_token   = "hf_xxxx"
+> ```
+> TabPFN 클라이언트 키는 [PriorLabs 공식 사이트](https://priorlabs.ai)에서 발급받을 수 있습니다.
 
 ---
 
@@ -302,5 +396,64 @@ yfinance / Google News RSS
 |------|------|----------|
 | V1 | `ver1_1.py` (초기 섹션) | 기본 지표 분석 + SQLite 저장 |
 | V3 | `ml_stock.py` | LSTM 예측 + 감성분석 + 백테스트 통합 |
+| V3.2 | `ml_stock.py` | Google TabPFN 회귀 예측 추가 (T+1/T+4/T+7) |
 | V4 | `llm_stock.py` | 3인 LLM 페르소나 릴레이 토론 추가 |
 | V4.5 | `llm_stock.py` + `final_stock.py` | 파일 분리 + 결과 조회 모듈화 |
+
+---
+
+## 🤖 Google TabPFN 상세 안내
+
+**TabPFN** (Tabular Prior-data Fitted Network)은 **Prior Labs(Google DeepMind 출신 연구팀)** 이 개발한 테이블형 데이터 전용 Transformer 기반 파운데이션 모델입니다. 2025년 *Nature* 지에 게재되었으며, 소규모~중규모 데이터셋에서 XGBoost, LightGBM을 능가하는 성능을 보입니다.
+
+### TabPFN 버전 히스토리
+
+| 버전 | 출시 | 특징 |
+|------|------|------|
+| TabPFN v1 | 2023 | ICLR 2023 발표, 소형 분류 문제 특화 |
+| TabPFNv2 | 2025.01 | *Nature* 게재, 분류+회귀 통합, 성능 대폭 향상 |
+| TabPFN-2.5 | 2025.11 | 최대 50,000 샘플 × 2,000 피처 지원 |
+| TabPFN-3 | 2026 | 최대 1,000,000행 × 200 피처 지원 (현재 기본값) |
+
+### TabPFN 내부 자동 전처리 메커니즘
+
+TabPFN의 핵심 강점은 **사용자가 전처리를 할 필요가 없다**는 점입니다. 내부적으로 다음이 자동 처리됩니다:
+
+```
+원시 테이블 데이터 입력
+        │
+        ▼
+┌─────────────────────────────────────┐
+│   TabPFN 내부 자동 전처리 앙상블     │
+│                                     │
+│  ① 결측치 처리 (자동 보간)           │
+│  ② 수치형 스케일링 (랜덤 변환)       │
+│  ③ 범주형 인코딩 (자동)              │
+│  ④ 다중 전처리 설정 랜덤 샘플링     │
+│     → 각 설정을 Transformer 통과     │
+│     → 예측값 앙상블 평균화           │
+└─────────────────────────────────────┘
+        │
+        ▼
+   최종 예측값 (원시 스케일 그대로)
+```
+
+> ⚠️ **주의**: TabPFN에 데이터를 입력하기 전 `StandardScaler`, `MinMaxScaler`, `OneHotEncoder` 등을 수동 적용하면 **성능이 저하**됩니다. TabPFN 공식 문서에서도 "Avoid data preprocessing"을 권고합니다.
+
+### 본 프로젝트에서의 TabPFN 적용 방식
+
+```python
+# predict_tabpfn() 내부 — 정규화 없이 원시 피처 그대로 입력
+reg = TabPFNRegressor()           # 기본값: TabPFN-3 체크포인트 사용
+reg.fit(X_train, y_train)        # fit = 데이터 캐싱 (학습 가중치 업데이트 없음)
+pred_t1 = reg.predict(X_pred)    # 내부 앙상블 추론
+```
+
+| 항목 | 내용 |
+|------|------|
+| **모델** | `TabPFNRegressor` (회귀) |
+| **체크포인트** | TabPFN-3 (기본값) |
+| **라이선스** | 비상업용 (연구/포트폴리오 사용 가능) |
+| **권장 환경** | GPU (VRAM 8GB+) 또는 TabPFN Client API |
+| **공식 GitHub** | [PriorLabs/TabPFN](https://github.com/PriorLabs/TabPFN) |
+| **논문** | [Nature 2025](https://doi.org/10.1038/s41586-024-08328-6) |
