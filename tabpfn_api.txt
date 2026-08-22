@@ -1,2 +1,1 @@
-tabpfn_api = "tabpfn_sk_qO5YRpgKaEa47dOw4fQpAFYaR5rkxOHtlM5JEg3REWc"
-hf_token = "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"
+
