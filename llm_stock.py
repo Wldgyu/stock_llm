@@ -393,7 +393,7 @@ class StockAIAgentV4(StockAIAgentV3):
 if __name__ == "__main__":
     # ⚠️ 본체 서버의 실제 IP 주소를 입력하세요.
     # 같은 PC라면 "127.0.0.1", 원격 서버라면 실제 IP 
-    MY_MAIN_SERVER_IP = "125.134.170.132"
+    MY_MAIN_SERVER_IP = ""
 
     agent = StockAIAgentV4(server_ip=MY_MAIN_SERVER_IP)
     agent.run()
