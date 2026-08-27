@@ -1,585 +1,618 @@
-// ================================================================
-// app.js — Stock AI Dashboard Frontend Logic
-// ================================================================
+const API = "";
 
-const API = "http://localhost:5000";
+const state = {
+  stocks: [],
+  currentName: null,
+  currentSymbol: null,
+  currency: "USD",
+  interval: "1d",
+  priceChart: null,
+  rsiChart: null,
+  eventSource: null,
+  candleTimer: null,
+  requestId: 0,
+  aiOpen: false,
+};
 
-// ── State ─────────────────────────────────────────────────────────
-let currentStock = null;
-let chartInstance = null;
-let aiPanelOpen  = false;
+const $ = (id) => document.getElementById(id);
 
-// ── DOM refs ──────────────────────────────────────────────────────
-const $ = id => document.getElementById(id);
-
-// ── Page Router ───────────────────────────────────────────────────
-function showPage(pageId) {
-  document.querySelectorAll(".page").forEach(p => p.classList.remove("active"));
-  $(pageId).classList.add("active");
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
-// ── Toast ─────────────────────────────────────────────────────────
-function showToast(msg, duration = 4000) {
-  const existing = document.querySelector(".toast");
-  if (existing) existing.remove();
-
-  const el = document.createElement("div");
-  el.className = "toast";
-  el.innerHTML = `⚠️ ${msg}`;
-  document.body.appendChild(el);
-  setTimeout(() => el.remove(), duration);
-}
-
-// ── Formatters ────────────────────────────────────────────────────
-function formatPrice(val, symbol) {
-  if (val == null || val === "") return "—";
-  const n = parseFloat(val);
-  if (isNaN(n)) return "—";
-  // 한국 종목(KS)이면 원화, 아니면 달러
-  if (symbol && symbol.includes(".KS")) {
-    return n.toLocaleString("ko-KR", { maximumFractionDigits: 0 }) + " ₩";
+function formatPrice(value, currency = state.currency) {
+  const number = Number(value);
+  if (value == null || Number.isNaN(number)) return "—";
+  if (currency === "KRW" || currency?.endsWith(".KS")) {
+    return `${number.toLocaleString("ko-KR", { maximumFractionDigits: 0 })} ₩`;
   }
-  return "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return `$${number.toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
 }
 
-function formatNum(val, decimals = 2) {
-  if (val == null || val === "") return "—";
-  const n = parseFloat(val);
-  return isNaN(n) ? "—" : n.toFixed(decimals);
+function formatNumber(value, decimals = 2) {
+  const number = Number(value);
+  return value == null || Number.isNaN(number) ? "—" : number.toFixed(decimals);
+}
+
+function formatVolume(value) {
+  const number = Number(value);
+  if (!number) return "—";
+  if (number >= 1e9) return `${(number / 1e9).toFixed(2)}B`;
+  if (number >= 1e6) return `${(number / 1e6).toFixed(2)}M`;
+  if (number >= 1e3) return `${(number / 1e3).toFixed(1)}K`;
+  return number.toLocaleString();
 }
 
 function scoreColor(score) {
-  if (score == null) return "#8892a4";
-  const s = parseFloat(score);
-  if (s > 0.1)  return "#00e5a0";
-  if (s < -0.1) return "#ff4d6d";
+  const number = Number(score);
+  if (score == null || Number.isNaN(number)) return "#8892a4";
+  if (number > 0.1) return "#00e5a0";
+  if (number < -0.1) return "#ff4d6d";
   return "#f5c518";
 }
 
 function scoreLabel(score) {
-  if (score == null) return "데이터 없음";
-  const s = parseFloat(score);
-  if (s > 0.3)  return "강력 매수";
-  if (s > 0.1)  return "매수 우세";
-  if (s < -0.3) return "강력 매도";
-  if (s < -0.1) return "매도 우세";
+  const number = Number(score);
+  if (score == null || Number.isNaN(number)) return "데이터 없음";
+  if (number > 0.3) return "강력 매수";
+  if (number > 0.1) return "매수 우세";
+  if (number < -0.3) return "강력 매도";
+  if (number < -0.1) return "매도 우세";
   return "중립";
 }
 
-function personaIcon(persona) {
-  const map = { "주식전문가": "📊", "뉴스기업전문가": "📰", "최종결정자": "⚖️" };
-  return map[persona] || "🤖";
+function showPage(pageId) {
+  document.querySelectorAll(".page").forEach((page) => page.classList.remove("active"));
+  $(pageId)?.classList.add("active");
 }
 
-function personaIconBg(persona) {
-  const map = {
-    "주식전문가":     "rgba(0,212,255,0.12)",
-    "뉴스기업전문가": "rgba(245,197,24,0.12)",
-    "최종결정자":     "rgba(110,86,255,0.15)",
-  };
-  return map[persona] || "rgba(255,255,255,0.06)";
+function showToast(message) {
+  document.querySelector(".toast")?.remove();
+  const toast = document.createElement("div");
+  toast.className = "toast";
+  toast.textContent = message;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 3500);
 }
 
-// ── Status check ─────────────────────────────────────────────────
+async function fetchJson(url) {
+  const response = await fetch(url);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  return data;
+}
+
 async function loadStatus() {
   try {
-    const res = await fetch(`${API}/api/status`);
-    const data = await res.json();
-    const dot  = $("status-dot");
-    const text = $("status-text");
-    if (dot && text) {
-      dot.style.background = "#00e5a0";
-      text.textContent = `DB: analysis ${data.analysis_count}건 | persona ${data.persona_count}건`;
-    }
+    const data = await fetchJson(`${API}/api/status`);
+    $("status-dot").classList.remove("offline");
+    $("status-text").textContent =
+      `분석 ${data.analysis_count}건 · AI ${data.persona_count}건 · 실시간 ${data.live_count}/6`;
+    $("server-time").textContent = data.server_time?.slice(11) || "--:--:--";
   } catch {
-    const dot  = $("status-dot");
-    const text = $("status-text");
-    if (dot) dot.style.background = "#ff4d6d";
-    if (text) text.textContent = "서버 연결 오류";
+    $("status-dot").classList.add("offline");
+    $("status-text").textContent = "서버 연결 오류";
   }
 }
 
-// ── Main Page: Load stock list ─────────────────────────────────────
+function renderSkeletonCards(count = 6) {
+  return Array.from({ length: count }, () => `
+    <div class="stock-card skeleton-card">
+      <div class="skeleton skeleton-title"></div>
+      <div class="skeleton skeleton-price"></div>
+      <div class="skeleton skeleton-metrics"></div>
+    </div>
+  `).join("");
+}
+
+function renderStockCard(stock, index) {
+  const displayPrice = stock.price ?? stock.last_close;
+  const isLive = stock.price != null;
+  const change = Number(stock.pct);
+  const changeClass = change > 0 ? "up" : change < 0 ? "down" : "flat";
+  const changeText = stock.pct == null ? "시세 대기" : `${change >= 0 ? "+" : ""}${change.toFixed(2)}%`;
+  const rsi = Number(stock.rsi);
+  const rsiColor = stock.rsi == null ? "#8892a4" : rsi > 70 ? "#ff4d6d" : rsi < 30 ? "#00e5a0" : "#f5c518";
+  const sentiment = Number(stock.sentiment);
+  const sentimentColor = stock.sentiment == null ? "#8892a4" : sentiment > 0 ? "#00e5a0" : sentiment < 0 ? "#ff4d6d" : "#f5c518";
+  const finalScore = stock.final_score == null ? "—" : `${Number(stock.final_score) >= 0 ? "+" : ""}${Number(stock.final_score).toFixed(2)}`;
+
+  return `
+    <article class="stock-card" data-stock-index="${index}" tabindex="0" role="button">
+      <div class="card-accent-line"></div>
+      <div class="card-header">
+        <div class="card-ticker-wrap">
+          <span class="card-name">${escapeHtml(stock.name)}</span>
+          <span class="card-symbol">${escapeHtml(stock.symbol)}</span>
+        </div>
+        <span class="card-trend-badge">${escapeHtml(stock.trend_emoji)} ${escapeHtml(stock.trend_label)}</span>
+      </div>
+      <div class="card-price-row">
+        <div class="card-price" data-role="price">${formatPrice(displayPrice, stock.currency)}</div>
+        <span class="price-source">${isLive ? "실시간" : "최근 분석 종가"}</span>
+      </div>
+      <div class="card-change ${changeClass}" data-role="change">${changeText}</div>
+      <div class="card-metrics">
+        <div class="metric-item">
+          <span class="metric-label">RSI</span>
+          <strong class="metric-value" style="color:${rsiColor}">${formatNumber(stock.rsi, 1)}</strong>
+        </div>
+        <div class="metric-item">
+          <span class="metric-label">감성</span>
+          <strong class="metric-value" style="color:${sentimentColor}">${formatNumber(stock.sentiment, 2)}</strong>
+        </div>
+        <div class="metric-item">
+          <span class="metric-label">AI 점수</span>
+          <strong class="metric-value" style="color:${scoreColor(stock.final_score)}">${finalScore}</strong>
+        </div>
+      </div>
+    </article>
+  `;
+}
+
+function bindStockCards() {
+  $("stocks-grid").querySelectorAll(".stock-card[data-stock-index]").forEach((card) => {
+    const open = () => openDetail(state.stocks[Number(card.dataset.stockIndex)]);
+    card.addEventListener("click", open);
+    card.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        open();
+      }
+    });
+  });
+}
+
 async function loadStocks() {
   const grid = $("stocks-grid");
-  grid.innerHTML = renderSkeletonCards(3);
-
+  grid.innerHTML = renderSkeletonCards();
   try {
-    const res  = await fetch(`${API}/api/stocks`);
-    const data = await res.json();
-
-    if (!data.stocks || data.stocks.length === 0) {
-      grid.innerHTML = `
-        <div class="empty-state" style="grid-column:1/-1">
-          <div class="icon">📭</div>
-          <h3>분석 데이터가 없습니다</h3>
-          <p>먼저 <code>python ml_stock.py</code>를 실행하여<br>분석 데이터를 생성해주세요.</p>
-          ${data.message ? `<p style="margin-top:12px;font-size:13px;color:var(--accent-yellow)">${data.message}</p>` : ""}
-        </div>`;
+    const data = await fetchJson(`${API}/api/stocks`);
+    state.stocks = data.stocks || [];
+    if (!state.stocks.length) {
+      grid.innerHTML = '<div class="empty-state"><h3>표시할 종목이 없습니다.</h3></div>';
       return;
     }
-
-    // Timestamp
-    const ts = data.stocks[0]?.timestamp?.slice(0, 16) || "";
-    const tsEl = $("last-update");
-    if (tsEl && ts) tsEl.textContent = "마지막 분석: " + ts;
-
-    grid.innerHTML = data.stocks.map(s => renderStockCard(s)).join("");
-
-    // Attach click events
-    grid.querySelectorAll(".stock-card").forEach(card => {
-      card.addEventListener("click", () => {
-        const name = card.dataset.name;
-        openDetail(name);
-      });
-    });
-
-    // Animate score bars
-    requestAnimationFrame(() => {
-      data.stocks.forEach(s => {
-        const bar = document.querySelector(`.ai-score-bar[data-name="${s.name}"]`);
-        if (!bar || s.final_score == null) return;
-        const score = parseFloat(s.final_score);
-        const pct = ((score + 1) / 2) * 100; // -1~+1 → 0~100%
-        const center = 50;
-        if (score >= 0) {
-          bar.style.left   = center + "%";
-          bar.style.width  = (pct - center) + "%";
-          bar.style.background = "linear-gradient(90deg, #00e5a0, #00d4ff)";
-        } else {
-          bar.style.left   = pct + "%";
-          bar.style.width  = (center - pct) + "%";
-          bar.style.background = "linear-gradient(90deg, #ff4d6d, #ff6b8a)";
-        }
-      });
-    });
-
-  } catch (e) {
-    console.error(e);
+    grid.innerHTML = state.stocks.map(renderStockCard).join("");
+    bindStockCards();
+    const timestamp = state.stocks.find((stock) => stock.timestamp)?.timestamp;
+    $("last-update").textContent = timestamp ? `최근 분석 ${timestamp.slice(0, 16)}` : "분석 데이터 대기 중";
+  } catch (error) {
     grid.innerHTML = `
-      <div class="empty-state" style="grid-column:1/-1">
-        <div class="icon">🔌</div>
-        <h3>서버에 연결할 수 없습니다</h3>
-        <p><code>python app.py</code>를 실행하고 새로고침해주세요.</p>
+      <div class="empty-state">
+        <h3>서버에서 종목을 불러오지 못했습니다.</h3>
+        <p>${escapeHtml(error.message)}</p>
       </div>`;
   }
 }
 
-function renderStockCard(s) {
-  const priceStr   = formatPrice(s.last_close, s.symbol);
-  const rsiColor   = s.rsi > 70 ? "#ff4d6d" : s.rsi < 30 ? "#00e5a0" : "#f5c518";
-  const sentColor  = s.sentiment > 0 ? "#00e5a0" : s.sentiment < 0 ? "#ff4d6d" : "#f5c518";
-  const scoreStr   = s.final_score != null ? (parseFloat(s.final_score) >= 0 ? "+" : "") + parseFloat(s.final_score).toFixed(2) : "N/A";
-  const sc         = scoreColor(s.final_score);
+function updateQuote(quote) {
+  const stock = state.stocks.find((item) => item.symbol === quote.symbol);
+  if (stock) Object.assign(stock, quote);
 
+  document.querySelectorAll(".stock-card[data-stock-index]").forEach((card) => {
+    const item = state.stocks[Number(card.dataset.stockIndex)];
+    if (item?.symbol !== quote.symbol) return;
+    const change = Number(quote.pct || 0);
+    const changeElement = card.querySelector('[data-role="change"]');
+    card.querySelector('[data-role="price"]').textContent = formatPrice(quote.price, quote.currency);
+    changeElement.textContent = `${change >= 0 ? "+" : ""}${change.toFixed(2)}%`;
+    changeElement.className = `card-change ${change > 0 ? "up" : change < 0 ? "down" : "flat"}`;
+  });
+
+  if (quote.symbol === state.currentSymbol) updateDetailQuote(quote);
+}
+
+function updateDetailQuote(quote) {
+  const change = Number(quote.pct || 0);
+  const priceElement = $("detail-price");
+  const changeElement = $("detail-change");
+  priceElement.textContent = formatPrice(quote.price, quote.currency || state.currency);
+  priceElement.className = `detail-price ${change > 0 ? "up" : change < 0 ? "down" : ""}`;
+  changeElement.textContent =
+    `${change >= 0 ? "+" : ""}${formatNumber(quote.change, 2)} ` +
+    `(${change >= 0 ? "+" : ""}${change.toFixed(2)}%)`;
+  changeElement.className = `detail-change ${change > 0 ? "up" : change < 0 ? "down" : "flat"}`;
+  $("detail-timestamp").textContent = quote.ts ? `실시간 갱신 ${quote.ts}` : "실시간 갱신";
+}
+
+function connectLiveStream() {
+  state.eventSource?.close();
+  state.eventSource = new EventSource(`${API}/api/live/stream`);
+  state.eventSource.onmessage = (event) => {
+    try {
+      JSON.parse(event.data).forEach(updateQuote);
+      $("status-dot").classList.remove("offline");
+      $("server-time").textContent = new Date().toLocaleTimeString("ko-KR", { hour12: false });
+    } catch (error) {
+      console.error("SSE 데이터 처리 실패", error);
+    }
+  };
+  state.eventSource.onerror = () => $("status-dot").classList.add("offline");
+}
+
+function analysisKpi(label, value, subtext, color = "var(--text-primary)") {
   return `
-    <div class="stock-card" data-name="${s.name}" id="card-${s.name}">
-      <div class="card-accent-line"></div>
-      <div class="card-header">
-        <div class="card-ticker-wrap">
-          <div class="card-name">${s.name}</div>
-          <div class="card-symbol">${s.symbol || ""}</div>
-        </div>
-        <div class="card-trend-badge">
-          ${s.trend_emoji} <span style="color:var(--text-secondary)">${s.trend_label}</span>
-        </div>
-      </div>
-
-      <div class="card-price">
-        ${priceStr}
-        <span class="card-price-label">현재가</span>
-      </div>
-
-      <div class="card-metrics">
-        <div class="metric-item">
-          <div class="metric-label">RSI</div>
-          <div class="metric-value" style="color:${rsiColor}">${formatNum(s.rsi, 1)}</div>
-        </div>
-        <div class="metric-item">
-          <div class="metric-label">감성점수</div>
-          <div class="metric-value" style="color:${sentColor}">${s.sentiment != null ? (s.sentiment >= 0 ? "+" : "") + formatNum(s.sentiment, 2) : "—"}</div>
-        </div>
-        <div class="metric-item">
-          <div class="metric-label">리스크</div>
-          <div class="metric-value">${s.risk_score != null ? s.risk_score + "/10" : "—"}</div>
-        </div>
-      </div>
-
-      <div class="card-ai-score">
-        <span class="ai-score-label">🤖 AI 점수</span>
-        <div class="ai-score-bar-wrap">
-          <div class="ai-score-bar" data-name="${s.name}" style="width:0%"></div>
-        </div>
-        <span class="ai-score-value" style="color:${sc}">${scoreStr}</span>
-      </div>
+    <div class="kpi-card">
+      <span class="kpi-label">${escapeHtml(label)}</span>
+      <strong class="kpi-value" style="color:${color}">${escapeHtml(value)}</strong>
+      <span class="kpi-sub">${escapeHtml(subtext)}</span>
     </div>`;
 }
 
-function renderSkeletonCards(n) {
-  return Array.from({ length: n }, () => `
-    <div class="stock-card" style="pointer-events:none">
-      <div class="skeleton" style="height:18px;width:50%;margin-bottom:8px"></div>
-      <div class="skeleton" style="height:12px;width:30%;margin-bottom:24px"></div>
-      <div class="skeleton" style="height:32px;width:60%;margin-bottom:20px"></div>
-      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px">
-        <div class="skeleton" style="height:56px"></div>
-        <div class="skeleton" style="height:56px"></div>
-        <div class="skeleton" style="height:56px"></div>
-      </div>
-      <div class="skeleton" style="height:42px"></div>
-    </div>`).join("");
+function renderAnalysis(data) {
+  const latest = data.latest || {};
+  const rsi = Number(latest.rsi);
+  const sentiment = Number(latest.sentiment);
+  const risk = Number(latest.risk_score);
+  const isNumber = (value) => value != null && value !== "" && Number.isFinite(Number(value));
+  const isPositive = (value) => isNumber(value) && Number(value) > 0;
+  const cards = [];
+
+  if (isNumber(latest.rsi)) {
+    cards.push(analysisKpi("RSI", formatNumber(latest.rsi, 1), data.trend_label || "추세", rsi > 70 ? "#ff4d6d" : rsi < 30 ? "#00e5a0" : "#f5c518"));
+  }
+  if (isPositive(latest.support)) {
+    cards.push(analysisKpi("지지선", formatPrice(latest.support, data.currency), "최근 20일 저가", "#00e5a0"));
+  }
+  if (isPositive(latest.resistance)) {
+    cards.push(analysisKpi("저항선", formatPrice(latest.resistance, data.currency), "최근 20일 고가", "#ff4d6d"));
+  }
+  if (isNumber(latest.sentiment)) {
+    cards.push(analysisKpi("감성점수", formatNumber(latest.sentiment, 2), "뉴스 감성", sentiment > 0 ? "#00e5a0" : sentiment < 0 ? "#ff4d6d" : "#f5c518"));
+  }
+  if (isPositive(latest.usd_krw)) {
+    cards.push(analysisKpi("USD/KRW", formatNumber(latest.usd_krw, 1), "환율", "#00d4ff"));
+  }
+  if (isPositive(latest.sox)) {
+    cards.push(analysisKpi("SOX", formatNumber(latest.sox, 1), "반도체 지수", "#9b6fff"));
+  }
+  if (isNumber(latest.risk_score) && risk >= 1) {
+    cards.push(analysisKpi("리스크", `${risk} / 10`, "변동성 기반", risk > 7 ? "#ff4d6d" : risk < 4 ? "#00e5a0" : "#f5c518"));
+  }
+
+  $("analysis-kpis").innerHTML = cards.join("");
+  $("analysis-section").hidden = cards.length === 0;
+
+  $("detail-trend").textContent = `${data.trend_emoji || "⚖️"} ${data.trend_label || "중립"}`;
+  $("analysis-close").textContent = latest.last_close == null
+    ? ""
+    : `최근 분석 종가 ${formatPrice(latest.last_close, data.currency)} · ${latest.timestamp?.slice(0, 16) || ""}`;
+  $("analysis-message").textContent = cards.length ? (data.message || "") : "";
+  renderPredictions(latest, data.currency);
 }
 
-// ── Detail Page ────────────────────────────────────────────────────
-async function openDetail(name) {
-  currentStock = name;
-  aiPanelOpen  = false;
+function renderPredictions(latest, currency) {
+  const low = latest.pred_low;
+  const high = latest.pred_high;
+  if (low == null || high == null) {
+    $("prediction-section").hidden = true;
+    $("prediction-cards").innerHTML = "";
+    return;
+  }
+  $("prediction-section").hidden = false;
+  const middle = (Number(low) + Number(high)) / 2;
+  $("prediction-cards").innerHTML = `
+    <div class="prediction-card">
+      <span class="pred-day">예측 하단</span>
+      <strong class="pred-price down">${formatPrice(low, currency)}</strong>
+      <span class="pred-range">T+1 · T+4 · T+7 최솟값</span>
+    </div>
+    <div class="prediction-card">
+      <span class="pred-day">예측 중앙</span>
+      <strong class="pred-price">${formatPrice(middle, currency)}</strong>
+      <span class="pred-range">예측 범위 중앙값</span>
+    </div>
+    <div class="prediction-card">
+      <span class="pred-day">예측 상단</span>
+      <strong class="pred-price up">${formatPrice(high, currency)}</strong>
+      <span class="pred-range">T+1 · T+4 · T+7 최댓값</span>
+    </div>`;
+}
+
+function resetDetail() {
+  $("analysis-section").hidden = false;
+  $("prediction-section").hidden = false;
+  $("analysis-kpis").innerHTML = Array.from({ length: 7 }, () =>
+    '<div class="kpi-card"><div class="skeleton kpi-skeleton"></div></div>'
+  ).join("");
+  $("live-kpis").innerHTML = "";
+  $("prediction-cards").innerHTML = '<div class="skeleton prediction-skeleton"></div>';
+  $("analysis-message").textContent = "";
+  $("analysis-close").textContent = "";
+  setChartLoading(true);
+  destroyCharts();
+  closeAiPanel();
+}
+
+async function openDetail(stock) {
+  if (!stock) return;
+  state.currentName = stock.name;
+  state.currentSymbol = stock.symbol;
+  state.currency = stock.currency || (stock.symbol?.endsWith(".KS") ? "KRW" : "USD");
+  state.interval = "1d";
+  state.requestId += 1;
+  const requestId = state.requestId;
 
   showPage("detail-page");
+  resetDetail();
+  document.querySelectorAll(".interval-btn").forEach((button) => {
+    button.classList.toggle("active", button.dataset.interval === "1d");
+  });
+  $("detail-name").textContent = stock.name;
+  $("detail-symbol").textContent = stock.symbol || "—";
+  updateDetailQuote(stock);
 
-  // Reset AI panel
-  const panel = $("ai-panel");
-  panel.classList.remove("open");
-  $("ai-btn").classList.remove("active");
-  $("ai-panel-content").innerHTML = "";
-
-  // Reset content
-  $("detail-name").textContent    = name;
-  $("detail-symbol").textContent  = "로딩 중...";
-  $("detail-price").textContent   = "—";
-  $("detail-timestamp").textContent = "";
-  $("kpi-row").innerHTML          = renderKpiSkeletons(5);
-  $("prediction-cards").innerHTML = `<div class="skeleton" style="height:80px"></div><div class="skeleton" style="height:80px"></div><div class="skeleton" style="height:80px"></div>`;
-
-  if (chartInstance) {
-    chartInstance.destroy();
-    chartInstance = null;
-  }
-
+  loadCandles(requestId);
   try {
-    const res  = await fetch(`${API}/api/stock/${encodeURIComponent(name)}`);
-    if (!res.ok) throw new Error(await res.text());
-    const data = await res.json();
-
-    const l = data.latest || {};
-    $("detail-symbol").textContent    = data.symbol || "";
-    $("detail-price").textContent     = formatPrice(l.last_close, data.symbol);
-    $("detail-timestamp").textContent = l.timestamp ? "분석: " + l.timestamp.slice(0, 16) : "";
-    $("detail-trend-badge").innerHTML = `${data.trend_emoji} ${data.trend_label}`;
-
-    // KPI row
-    $("kpi-row").innerHTML = renderKpiCards(l, data);
-
-    // llm_only 모드 — 차트/예측 없음 안내
-    if (data.source === "llm_only" || !data.chart || data.chart.labels.length === 0) {
-      document.querySelector(".chart-section").innerHTML = `
-        <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:200px;gap:14px;color:var(--text-secondary)">
-          <div style="font-size:40px">📊</div>
-          <div style="font-weight:600;color:var(--text-primary)">차트 데이터 없음</div>
-          <div style="font-size:13px;text-align:center;line-height:1.7">
-            ${data.message || "ml_stock.py를 실행하면 가격 차트와 기술지표를 볼 수 있습니다."}
-          </div>
-        </div>`;
-      $("prediction-cards").innerHTML = `
-        <div style="grid-column:1/-1;color:var(--text-muted);font-size:13px;text-align:center;padding:20px">
-          LSTM 예측가는 ml_stock.py 실행 후 표시됩니다.
-        </div>`;
-    } else {
-      // Chart
-      renderChart(data.chart, data.symbol);
-      // Prediction cards
-      renderPredictionCards(l, data.symbol);
+    const data = await fetchJson(`${API}/api/stock/${encodeURIComponent(stock.name)}`);
+    if (requestId !== state.requestId) return;
+    state.currentSymbol = data.symbol || state.currentSymbol;
+    state.currency = data.currency || state.currency;
+    renderAnalysis(data);
+  } catch (error) {
+    if (requestId === state.requestId) {
+      $("analysis-message").textContent = error.message;
+      renderAnalysis({ latest: {}, currency: state.currency, message: error.message });
     }
+  }
 
-  } catch (e) {
-    showToast("데이터 로드 실패: " + e.message);
+  clearInterval(state.candleTimer);
+  state.candleTimer = setInterval(() => {
+    if ($("detail-page").classList.contains("active")) loadCandles(state.requestId, false);
+  }, 30000);
+}
+
+function setChartLoading(visible) {
+  $("chart-loading").style.display = visible ? "flex" : "none";
+}
+
+function renderLiveKpis(last, meta) {
+  const items = [
+    ["MA5", formatPrice(last.ma5, state.currency)],
+    ["MA20", formatPrice(last.ma20, state.currency)],
+    ["MA60", formatPrice(last.ma60, state.currency)],
+    ["BB 상단", formatPrice(last.bb_up, state.currency)],
+    ["BB 하단", formatPrice(last.bb_low, state.currency)],
+    ["RSI(14)", formatNumber(last.rsi, 1)],
+    ["거래량", formatVolume(meta.volume || last.v)],
+  ];
+  $("live-kpis").innerHTML = items.map(([label, value]) => `
+    <div class="live-kpi">
+      <span>${label}</span>
+      <strong>${value}</strong>
+    </div>
+  `).join("");
+}
+
+async function loadCandles(requestId = state.requestId, showLoading = true) {
+  if (!state.currentSymbol) return;
+  if (showLoading) setChartLoading(true);
+  try {
+    const data = await fetchJson(
+      `${API}/api/live/candles/${encodeURIComponent(state.currentSymbol)}?interval=${state.interval}`
+    );
+    if (requestId !== state.requestId) return;
+    const candles = data.candles || [];
+    if (!candles.length) throw new Error("해당 구간의 가격 데이터가 없습니다.");
+    const last = candles.at(-1);
+    renderLiveKpis(last, data.meta || {});
+    if (data.meta?.price != null) updateDetailQuote(data.meta);
+    renderLiveCharts(candles);
+  } catch (error) {
+    if (requestId === state.requestId) showToast(`차트 로드 실패: ${error.message}`);
+  } finally {
+    if (requestId === state.requestId) setChartLoading(false);
   }
 }
 
-function renderKpiSkeletons(n) {
-  return Array.from({ length: n }, () =>
-    `<div class="kpi-card"><div class="skeleton" style="height:12px;width:60%;margin-bottom:12px"></div><div class="skeleton" style="height:22px;width:80%"></div></div>`
-  ).join("");
+function destroyCharts() {
+  state.priceChart?.destroy();
+  state.rsiChart?.destroy();
+  state.priceChart = null;
+  state.rsiChart = null;
 }
 
-function renderKpiCards(l, data) {
-  const items = [
-    { label: "RSI",    value: formatNum(l.rsi, 1),    sub: data.trend_label,   color: l.rsi > 70 ? "#ff4d6d" : l.rsi < 30 ? "#00e5a0" : "#f5c518" },
-    { label: "지지선",  value: formatPrice(l.support, data.symbol),  sub: "Support",  color: "#00e5a0" },
-    { label: "저항선",  value: formatPrice(l.resistance, data.symbol), sub: "Resistance", color: "#ff4d6d" },
-    { label: "감성점수", value: l.sentiment != null ? (l.sentiment >= 0 ? "+" : "") + formatNum(l.sentiment, 2) : "—", sub: "뉴스 감성", color: l.sentiment > 0 ? "#00e5a0" : l.sentiment < 0 ? "#ff4d6d" : "#f5c518" },
-    { label: "USD/KRW", value: l.usd_krw ? parseFloat(l.usd_krw).toFixed(1) : "—", sub: "환율", color: "#00d4ff" },
-    { label: "SOX 지수", value: l.sox ? parseFloat(l.sox).toFixed(1) : "—", sub: "반도체 지수", color: "#9b6fff" },
-    { label: "리스크",  value: l.risk_score != null ? l.risk_score + " / 10" : "—", sub: "Risk Score", color: l.risk_score > 7 ? "#ff4d6d" : l.risk_score < 4 ? "#00e5a0" : "#f5c518" },
-  ];
+const CHART_COLORS = {
+  price: "#4f8ef7",
+  ma5: "#f5c518",
+  ma20: "#9d6fff",
+  ma60: "#ff8c42",
+  upper: "rgba(255,77,109,.55)",
+  lower: "rgba(0,229,160,.55)",
+  grid: "rgba(255,255,255,.05)",
+  tick: "#5f6b82",
+};
 
-  return items.map(item => `
-    <div class="kpi-card">
-      <div class="kpi-label">${item.label}</div>
-      <div class="kpi-value" style="color:${item.color}">${item.value}</div>
-      <div class="kpi-sub">${item.sub}</div>
-    </div>`).join("");
-}
+function renderLiveCharts(candles) {
+  if (typeof Chart === "undefined") {
+    showToast("Chart.js를 불러오지 못했습니다.");
+    return;
+  }
+  destroyCharts();
+  const labels = candles.map((candle) => candle.t);
+  const values = (key) => candles.map((candle) => candle[key]);
+  const priceContext = $("live-price-chart").getContext("2d");
+  const gradient = priceContext.createLinearGradient(0, 0, 0, 360);
+  gradient.addColorStop(0, "rgba(79,142,247,.22)");
+  gradient.addColorStop(1, "rgba(79,142,247,0)");
 
-function renderChart(chart, symbol) {
-  const ctx = $("price-chart");
-  if (!ctx) return;
-
-  if (chartInstance) chartInstance.destroy();
-
-  const labels = chart.labels || [];
-  const prices = chart.prices || [];
-  const predLow  = chart.pred_low || [];
-  const predHigh = chart.pred_high || [];
-
-  // Gradient fill
-  const chartCtx = ctx.getContext("2d");
-  const gradient = chartCtx.createLinearGradient(0, 0, 0, 280);
-  gradient.addColorStop(0, "rgba(110, 86, 255, 0.25)");
-  gradient.addColorStop(1, "rgba(110, 86, 255, 0.00)");
-
-  const gradCyan = chartCtx.createLinearGradient(0, 0, 0, 280);
-  gradCyan.addColorStop(0, "rgba(0, 212, 255, 0.12)");
-  gradCyan.addColorStop(1, "rgba(0, 212, 255, 0.00)");
-
-  chartInstance = new Chart(chartCtx, {
+  state.priceChart = new Chart(priceContext, {
     type: "line",
     data: {
       labels,
       datasets: [
-        {
-          label: "실제가",
-          data: prices,
-          borderColor: "#6e56ff",
-          backgroundColor: gradient,
-          borderWidth: 2.5,
-          pointRadius: labels.length > 15 ? 0 : 4,
-          pointHoverRadius: 6,
-          pointBackgroundColor: "#6e56ff",
-          tension: 0.4,
-          fill: true,
-        },
-        {
-          label: "예측 하단",
-          data: predLow,
-          borderColor: "rgba(0,229,160,0.6)",
-          backgroundColor: "transparent",
-          borderWidth: 1.5,
-          borderDash: [4, 4],
-          pointRadius: 0,
-          tension: 0.4,
-        },
-        {
-          label: "예측 상단",
-          data: predHigh,
-          borderColor: "rgba(255,77,109,0.6)",
-          backgroundColor: "transparent",
-          borderWidth: 1.5,
-          borderDash: [4, 4],
-          pointRadius: 0,
-          tension: 0.4,
-        },
+        { label: "BB 상단", data: values("bb_up"), borderColor: CHART_COLORS.upper, borderWidth: 1, pointRadius: 0, fill: "+1", backgroundColor: "rgba(157,111,255,.05)", tension: 0.25, spanGaps: true },
+        { label: "BB 하단", data: values("bb_low"), borderColor: CHART_COLORS.lower, borderWidth: 1, pointRadius: 0, fill: false, tension: 0.25, spanGaps: true },
+        { label: "MA60", data: values("ma60"), borderColor: CHART_COLORS.ma60, borderWidth: 1.2, pointRadius: 0, tension: 0.25, spanGaps: true },
+        { label: "MA20", data: values("ma20"), borderColor: CHART_COLORS.ma20, borderWidth: 1.2, pointRadius: 0, tension: 0.25, spanGaps: true },
+        { label: "MA5", data: values("ma5"), borderColor: CHART_COLORS.ma5, borderWidth: 1.2, pointRadius: 0, tension: 0.25, spanGaps: true },
+        { label: "종가", data: values("c"), borderColor: CHART_COLORS.price, backgroundColor: gradient, borderWidth: 2, pointRadius: 0, fill: true, tension: 0.25, spanGaps: true },
       ],
     },
     options: {
       responsive: true,
       maintainAspectRatio: false,
-      animation: { duration: 800, easing: "easeInOutQuart" },
+      animation: { duration: 250 },
       interaction: { mode: "index", intersect: false },
       plugins: {
-        legend: { display: false },
+        legend: { labels: { color: CHART_COLORS.tick, boxWidth: 12, font: { size: 10 } } },
         tooltip: {
-          backgroundColor: "rgba(10,15,35,0.95)",
-          borderColor: "rgba(110,86,255,0.4)",
-          borderWidth: 1,
-          titleColor: "#f0f4ff",
-          bodyColor: "#8892a4",
-          padding: 12,
+          backgroundColor: "rgba(8,13,26,.96)",
           callbacks: {
-            label: ctx => {
-              const v = ctx.parsed.y;
-              if (v == null) return null;
-              return ` ${ctx.dataset.label}: ${formatPrice(v, symbol)}`;
-            }
-          }
-        }
+            label: (context) => ` ${context.dataset.label}: ${formatPrice(context.parsed.y)}`,
+          },
+        },
       },
       scales: {
-        x: {
-          grid: { color: "rgba(255,255,255,0.04)", drawBorder: false },
-          ticks: { color: "#4a5568", font: { size: 11, family: "JetBrains Mono" }, maxTicksLimit: 8, maxRotation: 0 },
-        },
+        x: { grid: { color: CHART_COLORS.grid }, ticks: { color: CHART_COLORS.tick, maxTicksLimit: 9, maxRotation: 0 } },
+        y: { position: "right", grid: { color: CHART_COLORS.grid }, ticks: { color: CHART_COLORS.tick, callback: (value) => formatPrice(value) } },
+      },
+    },
+  });
+
+  const rsiContext = $("live-rsi-chart").getContext("2d");
+  state.rsiChart = new Chart(rsiContext, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{ label: "RSI", data: values("rsi"), borderColor: CHART_COLORS.ma5, borderWidth: 1.5, pointRadius: 0, tension: 0.25, spanGaps: true }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      plugins: { legend: { display: false }, tooltip: { enabled: false } },
+      scales: {
+        x: { display: false },
         y: {
-          position: "right",
-          grid: { color: "rgba(255,255,255,0.04)", drawBorder: false },
-          ticks: {
-            color: "#4a5568",
-            font: { size: 11, family: "JetBrains Mono" },
-            callback: v => symbol?.includes(".KS") ? v.toLocaleString("ko-KR") + "₩" : "$" + v.toLocaleString("en-US"),
-          }
-        }
-      }
-    }
+          min: 0,
+          max: 100,
+          grid: { color: CHART_COLORS.grid },
+          ticks: { color: CHART_COLORS.tick, callback: (value) => [30, 50, 70].includes(value) ? value : null },
+        },
+      },
+    },
+    plugins: [{
+      id: "rsiZones",
+      beforeDraw(chart) {
+        const { ctx, chartArea, scales } = chart;
+        if (!chartArea) return;
+        const y70 = scales.y.getPixelForValue(70);
+        const y30 = scales.y.getPixelForValue(30);
+        ctx.save();
+        ctx.fillStyle = "rgba(255,77,109,.10)";
+        ctx.fillRect(chartArea.left, chartArea.top, chartArea.width, y70 - chartArea.top);
+        ctx.fillStyle = "rgba(0,229,160,.10)";
+        ctx.fillRect(chartArea.left, y30, chartArea.width, chartArea.bottom - y30);
+        ctx.restore();
+      },
+    }],
   });
 }
 
-function renderPredictionCards(l, symbol) {
-  const predLow  = l.pred_low;
-  const predHigh = l.pred_high;
-  const midVal   = (predLow != null && predHigh != null)
-    ? (parseFloat(predLow) + parseFloat(predHigh)) / 2
-    : null;
-
-  $("prediction-cards").innerHTML = `
-    <div class="prediction-card">
-      <div class="pred-day">🔮 T+1 (내일)</div>
-      <div class="pred-price">${formatPrice(midVal, symbol)}</div>
-      <div class="pred-range">예측 중앙값</div>
-    </div>
-    <div class="prediction-card">
-      <div class="pred-day">📉 예측 하단</div>
-      <div class="pred-price" style="color:#ff4d6d">${formatPrice(predLow, symbol)}</div>
-      <div class="pred-range">LSTM 하한</div>
-    </div>
-    <div class="prediction-card">
-      <div class="pred-day">📈 예측 상단</div>
-      <div class="pred-price" style="color:#00e5a0">${formatPrice(predHigh, symbol)}</div>
-      <div class="pred-range">LSTM 상한</div>
-    </div>`;
+function personaIcon(persona) {
+  return { 주식전문가: "📊", 뉴스기업전문가: "📰", 최종결정자: "⚖️" }[persona] || "🤖";
 }
 
-// ── AI Panel ───────────────────────────────────────────────────────
-async function toggleAiPanel() {
-  if (!currentStock) return;
+async function openAiPanel() {
+  if (!state.currentName) return;
+  state.aiOpen = true;
+  $("ai-panel").classList.add("open");
+  $("ai-panel").setAttribute("aria-hidden", "false");
+  $("ai-button").classList.add("active");
+  $("ai-stock-name").textContent = state.currentName;
+  const content = $("ai-panel-content");
+  content.innerHTML = '<div class="ai-loading"><span class="spinner"></span><span>AI 분석 로드 중...</span></div>';
 
-  aiPanelOpen = !aiPanelOpen;
-  const panel     = $("ai-panel");
-  const btn       = $("ai-btn");
-  const mainArea  = $("detail-main");
-  const nameLabel = $("ai-panel-stock-name");
+  try {
+    const data = await fetchJson(`${API}/api/stock/${encodeURIComponent(state.currentName)}/ai`);
+    if (!state.aiOpen || data.name !== state.currentName) return;
+    const order = ["주식전문가", "뉴스기업전문가", "최종결정자"];
+    const personas = order.map((name) => data.personas.find((item) => item.persona === name)).filter(Boolean);
+    const final = data.final;
+    const summary = final ? `
+      <div class="final-decision-summary">
+        <strong class="final-summary-score" style="color:${scoreColor(final.score)}">${final.score == null ? "오류" : `${Number(final.score) >= 0 ? "+" : ""}${Number(final.score).toFixed(2)}`}</strong>
+        <div class="final-summary-info">
+          <span class="final-summary-label">최종 판단</span>
+          <strong class="final-summary-verdict" style="color:${scoreColor(final.score)}">${scoreLabel(final.score)}</strong>
+        </div>
+        <p class="final-summary-opinion">${escapeHtml(final.opinion || "")}</p>
+      </div>` : "";
 
-  if (aiPanelOpen) {
-    panel.classList.add("open");
-    btn.classList.add("active");
-    if (mainArea)  mainArea.style.paddingBottom = "500px";
-    if (nameLabel) nameLabel.textContent = currentStock;
-    await loadAiPanel(currentStock);
-  } else {
-    panel.classList.remove("open");
-    btn.classList.remove("active");
-    if (mainArea) mainArea.style.paddingBottom = "";
+    const cards = personas.map((persona) => {
+      const hasScore = persona.score != null;
+      const score = hasScore ? Number(persona.score) : 0;
+      const percent = ((score + 1) / 2) * 100;
+      const gauge = hasScore ? `
+        <div class="score-gauge">
+          <span class="score-gauge-center"></span>
+          <span class="score-gauge-fill" style="left:${score >= 0 ? 50 : percent}%;width:${Math.abs(percent - 50)}%;background:${score >= 0 ? "#00e5a0" : "#ff4d6d"}"></span>
+        </div>` : "";
+      return `
+        <article class="persona-card">
+          <div class="persona-header">
+            <span class="persona-name"><span class="persona-icon">${personaIcon(persona.persona)}</span>${escapeHtml(persona.persona)}</span>
+            <span class="persona-score-wrap">
+              <strong class="persona-score" style="color:${scoreColor(persona.score)}">${hasScore ? `${score >= 0 ? "+" : ""}${score.toFixed(2)}` : "—"}</strong>
+              <span class="persona-signal" style="color:${scoreColor(persona.score)}">${escapeHtml(persona.signal)}</span>
+            </span>
+          </div>
+          ${gauge}
+          <p class="persona-opinion">${escapeHtml(persona.opinion || "의견 없음")}</p>
+        </article>`;
+    }).join("");
+    content.innerHTML = summary + `<div class="ai-personas-grid">${cards}</div>`;
+  } catch (error) {
+    content.innerHTML = `<div class="empty-state"><h3>AI 분석 없음</h3><p>${escapeHtml(error.message)}</p></div>`;
   }
 }
 
 function closeAiPanel() {
-  aiPanelOpen = false;
+  state.aiOpen = false;
   $("ai-panel").classList.remove("open");
-  $("ai-btn").classList.remove("active");
-  const mainArea = $("detail-main");
-  if (mainArea) mainArea.style.paddingBottom = "";
+  $("ai-panel").setAttribute("aria-hidden", "true");
+  $("ai-button").classList.remove("active");
 }
 
-async function loadAiPanel(name) {
-  const content = $("ai-panel-content");
-  content.innerHTML = `
-    <div class="ai-loading">
-      <div class="spinner"></div>
-      <span>AI 분석 데이터 로드 중...</span>
-    </div>`;
-
-  try {
-    const res  = await fetch(`${API}/api/stock/${encodeURIComponent(name)}/ai`);
-    if (!res.ok) {
-      const err = await res.json();
-      content.innerHTML = `
-        <div class="empty-state" style="padding:40px 20px">
-          <div class="icon">🤖</div>
-          <h3>AI 분석 없음</h3>
-          <p>${err.error || "llm_stock.py를 먼저 실행하세요."}</p>
-        </div>`;
-      return;
-    }
-
-    const data    = await res.json();
-    const personas = data.personas || [];
-    const final    = data.final;
-
-    // ── 상단: 최종 결정 요약 바 ────────────────────────────────
-    let summaryHtml = "";
-    if (final) {
-      const fs   = parseFloat(final.score);
-      const fsc  = scoreColor(fs);
-      const sign = fs >= 0 ? "+" : "";
-      summaryHtml = `
-        <div class="final-decision-summary">
-          <div class="final-summary-score" style="color:${fsc}">${sign}${fs.toFixed(2)}</div>
-          <div class="final-summary-info">
-            <div class="final-summary-label">⚖️ 최종결정자 판단</div>
-            <div class="final-summary-verdict" style="color:${fsc}">${scoreLabel(fs)}</div>
-          </div>
-          <div class="final-summary-opinion">${final.opinion || ""}</div>
-        </div>`;
-    }
-
-    // ── 하단: 3인 페르소나 가로 그리드 ────────────────────────
-    // 순서 고정: 주식전문가 → 뉴스기업전문가 → 최종결정자
-    const ORDER = ["주식전문가", "뉴스기업전문가", "최종결정자"];
-    const sorted = ORDER.map(nm => personas.find(p => p.persona === nm)).filter(Boolean);
-
-    const cardsHtml = sorted.map(p => {
-      const score  = parseFloat(p.score);
-      const sc     = scoreColor(score);
-      const sign   = score >= 0 ? "+" : "";
-      const pct    = ((score + 1) / 2) * 100;
-      const gaugeLeft  = score >= 0 ? 50 : pct;
-      const gaugeWidth = Math.abs(pct - 50);
-      const gaugeColor = score >= 0 ? "#00e5a0" : "#ff4d6d";
-      const isFinal    = p.persona === "최종결정자";
-
-      return `
-        <div class="persona-card" style="${isFinal ? "border-color:rgba(110,86,255,0.3);background:rgba(110,86,255,0.05)" : ""}">
-          <div class="persona-header">
-            <div class="persona-name">
-              <div class="persona-icon" style="background:${personaIconBg(p.persona)}">${personaIcon(p.persona)}</div>
-              ${p.persona}
-            </div>
-            <div class="persona-score-wrap">
-              <div class="persona-score" style="color:${sc}">${sign}${Math.abs(score).toFixed(2)}</div>
-              <div class="persona-signal" style="color:${sc}">${p.signal}</div>
-            </div>
-          </div>
-          <div class="score-gauge">
-            <div class="score-gauge-center"></div>
-            <div class="score-gauge-fill" style="left:${gaugeLeft}%;width:${gaugeWidth}%;background:${gaugeColor}"></div>
-          </div>
-          <div class="persona-opinion">${p.opinion || "의견 없음"}</div>
-        </div>`;
-    }).join("");
-
-    content.innerHTML = summaryHtml + `<div class="ai-personas-grid">${cardsHtml}</div>`;
-
-  } catch (e) {
-    content.innerHTML = `
-      <div class="empty-state" style="padding:40px 20px">
-        <div class="icon">❌</div>
-        <h3>로드 실패</h3>
-        <p>${e.message}</p>
-      </div>`;
-  }
-}
-
-// ── Nav: Back to list ─────────────────────────────────────────────
-function goBack() {
-  currentStock = null;
-  aiPanelOpen  = false;
-  const panel = $("ai-panel");
-  if (panel) panel.classList.remove("open");
+function goHome() {
+  state.requestId += 1;
+  state.currentName = null;
+  state.currentSymbol = null;
+  clearInterval(state.candleTimer);
+  destroyCharts();
+  closeAiPanel();
   showPage("main-page");
 }
 
-// ── Init ──────────────────────────────────────────────────────────
-document.addEventListener("DOMContentLoaded", () => {
-  showPage("main-page");
-  loadStatus();
-  loadStocks();
+document.addEventListener("DOMContentLoaded", async () => {
+  $("home-button").addEventListener("click", goHome);
+  $("back-button").addEventListener("click", goHome);
+  $("ai-button").addEventListener("click", () => state.aiOpen ? closeAiPanel() : openAiPanel());
+  $("ai-close-button").addEventListener("click", closeAiPanel);
+  $("interval-bar").addEventListener("click", (event) => {
+    const button = event.target.closest(".interval-btn");
+    if (!button || button.dataset.interval === state.interval) return;
+    state.interval = button.dataset.interval;
+    document.querySelectorAll(".interval-btn").forEach((item) => item.classList.toggle("active", item === button));
+    loadCandles(state.requestId);
+  });
+
+  await Promise.all([loadStatus(), loadStocks()]);
+  connectLiveStream();
+  setInterval(loadStatus, 60000);
+});
+
+window.addEventListener("beforeunload", () => {
+  state.eventSource?.close();
+  clearInterval(state.candleTimer);
 });

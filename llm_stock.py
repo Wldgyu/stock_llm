@@ -12,12 +12,16 @@ llm_stock.py
 """
 
 import json
+import os
 import re
 import time
-import sqlite3
 import traceback
+import uuid
 import requests
 from datetime import datetime
+from typing import Optional
+
+from database import DB_PATH as DEFAULT_DB_PATH, connect_db
 
 # ml_stock.py 에서 공통 유틸 및 V3 에이전트 import
 from ml_stock import StockAIAgentV3, get_next_trading_date
@@ -115,12 +119,14 @@ class MarketAgentSimulator:
         self,
         ticker_name: str,
         stock_opinion: str,
-        stock_score: float,
+        stock_score: Optional[float],
         news_opinion: str,
-        news_score: float,
+        news_score: Optional[float],
     ):
         """최종결정자 페르소나를 Ollama에 호출합니다."""
         description = self.personas["최종결정자"]
+        stock_score_text = f"{stock_score:+.2f}" if stock_score is not None else "분석 실패"
+        news_score_text = f"{news_score:+.2f}" if news_score is not None else "분석 실패"
         prompt = (
             f"<start_of_turn>system\n"
             f"당신은 주식 시장 가상 토론의 최종 투자 의사 결정자인 '최종결정자'입니다.\n"
@@ -131,8 +137,8 @@ class MarketAgentSimulator:
             f"점수 범위는 -1.0(강력 매도/비관)에서 +1.0(강력 매수/낙관) 사이의 실수여야 합니다.\n<end_of_turn>\n"
             f"<start_of_turn>user\n"
             f"종목: {ticker_name}\n"
-            f"1. 주식전문가 분석 의견 (점수: {stock_score:+.2f}):\n{stock_opinion}\n\n"
-            f"2. 뉴스기업전문가 분석 의견 (점수: {news_score:+.2f}):\n{news_opinion}\n\n"
+            f"1. 주식전문가 분석 의견 (점수: {stock_score_text}):\n{stock_opinion}\n\n"
+            f"2. 뉴스기업전문가 분석 의견 (점수: {news_score_text}):\n{news_opinion}\n\n"
             f"두 전문가의 분석 결과를 토대로 최종적인 투자 방향성 및 의사결정을 내리고, 마지막 줄에 규격화된 JSON 점수를 남겨주세요.\n<end_of_turn>\n"
             f"<start_of_turn>model\n"
             f"최종결정자의 의사결정 리포트:\n"
@@ -163,33 +169,49 @@ class MarketAgentSimulator:
             self.clear_vram_cache(model_name)
 
     # ── JSON 점수 파싱 ────────────────────────
-    def parse_score_from_response(self, text: str) -> float:
+    def parse_score_from_response(self, text: str) -> Optional[float]:
         """응답 텍스트 마지막 JSON 에서 score 값을 추출합니다."""
         if not text:
-            return 0.0
+            return None
 
-        # 방법 1: JSON 블록 직접 파싱
-        try:
-            json_match = re.findall(r"\{.*?\}", text)
-            if json_match:
-                data = json.loads(json_match[-1])
-                if "score" in data:
-                    return float(data["score"])
-        except Exception:
-            pass
+        # 마지막 JSON 객체부터 확인해 본문에 있는 다른 숫자와 섞이지 않게 합니다.
+        json_blocks = re.findall(r"\{[^{}]*\}", text, flags=re.DOTALL)
+        for block in reversed(json_blocks):
+            try:
+                data = json.loads(block)
+                score = float(data["score"])
+                if -1.0 <= score <= 1.0:
+                    return score
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
 
-        # 방법 2: score 키워드 뒤 숫자 추출 (Fallback)
-        try:
-            if "score" in text.lower():
-                scores = re.findall(r"[-+]?\d*\.\d+|\d+", text)
-                if scores:
-                    val = float(scores[-1])
-                    if -1.0 <= val <= 1.0:
-                        return val
-        except Exception:
-            pass
+        # JSON이 깨졌을 때도 score 키 바로 뒤의 숫자만 제한적으로 복구합니다.
+        matches = re.findall(
+            r"""["']?score["']?\s*[:=]\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+))""",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if matches:
+            score = float(matches[-1])
+            if -1.0 <= score <= 1.0:
+                return score
+        return None
 
-        return 0.0
+    def parse_response(self, text: str):
+        """LLM 응답을 의견과 점수로 나누며 파싱 실패를 중립과 구분합니다."""
+        score = self.parse_score_from_response(text)
+        if not text:
+            return "분석 실패: 응답 없음", None
+
+        opinion = text.strip()
+        for match in reversed(list(re.finditer(r"\{[^{}]*\}", opinion, re.DOTALL))):
+            if "score" in match.group(0).lower():
+                opinion = (opinion[:match.start()] + opinion[match.end():]).strip()
+                break
+        opinion = opinion.strip("` \n")
+        if score is None:
+            return f"분석 실패: 점수 파싱 오류\n{opinion}", None
+        return opinion or "의견 없음", score
 
 
 # ──────────────────────────────────────────────
@@ -206,7 +228,7 @@ class StockAIAgentV4(StockAIAgentV3):
       4. 최종 리포트 출력
     """
 
-    DB_PATH = "stock_analysis.db"
+    DB_PATH = DEFAULT_DB_PATH
 
     def __init__(self, server_ip: str = "127.0.0.1"):
         super().__init__()  # StockAIAgentV3 초기화 (NLP 파이프라인 등)
@@ -216,15 +238,16 @@ class StockAIAgentV4(StockAIAgentV3):
 
         self.simulator = MarketAgentSimulator(
             server_ip=server_ip,
-            expert_model="gemma4:12b",
-            decision_model="gemma4:12b",
+            expert_model=os.environ.get("OLLAMA_EXPERT_MODEL", "gemma4:12b"),
+            decision_model=os.environ.get("OLLAMA_DECISION_MODEL", "gemma4:12b"),
         )
+        self.pause_seconds = float(os.environ.get("OLLAMA_PAUSE_SECONDS", "15"))
         self._init_persona_db()
 
     # ── DB 초기화 ─────────────────────────────
     def _init_persona_db(self):
         """페르소나 토론 로그 테이블을 SQLite에 생성합니다."""
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_db(self.db_path)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS persona_discussion_log (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -232,20 +255,34 @@ class StockAIAgentV4(StockAIAgentV3):
                 ticker_name  TEXT,
                 persona      TEXT,
                 opinion      TEXT,
-                score        REAL
+                score        REAL,
+                run_id       TEXT
             )
         """)
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(persona_discussion_log)")
+        }
+        if "run_id" not in columns:
+            conn.execute("ALTER TABLE persona_discussion_log ADD COLUMN run_id TEXT")
         conn.commit()
         conn.close()
 
     # ── 페르소나 결과 저장 ────────────────────
-    def save_persona_result(self, ticker_name: str, persona: str, opinion: str, score: float):
+    def save_persona_result(
+        self,
+        ticker_name: str,
+        persona: str,
+        opinion: str,
+        score: Optional[float],
+        run_id: str,
+    ):
         """단일 페르소나 결과를 즉각 커밋합니다 (Atomic Save)."""
-        conn = sqlite3.connect(self.db_path)
+        conn = connect_db(self.db_path)
         conn.execute(
             """
-            INSERT INTO persona_discussion_log (timestamp, ticker_name, persona, opinion, score)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO persona_discussion_log
+            (timestamp, ticker_name, persona, opinion, score, run_id)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -253,6 +290,7 @@ class StockAIAgentV4(StockAIAgentV3):
                 persona,
                 opinion,
                 score,
+                run_id,
             ),
         )
         conn.commit()
@@ -288,17 +326,40 @@ class StockAIAgentV4(StockAIAgentV3):
                 mdd       = data["mdd"]
                 sentiment = data["sentiment"]
                 titles    = data["titles"]
+                news_articles = data.get("news_articles", [])
                 preds     = data["preds"]
+                tabpfn_preds = data.get("tabpfn_preds")
+                run_id = uuid.uuid4().hex
 
                 # ── 페르소나 입력 데이터 구성 ──
-                limited_news   = titles[:3]
-                combined_news  = "\n".join([f"- {t}" for t in limited_news])
+                if news_articles:
+                    news_blocks = []
+                    for article in news_articles:
+                        content = article.get("body") or article.get("title", "")
+                        news_blocks.append(
+                            f"[언론사: {article.get('source', '알 수 없음')}]\n"
+                            f"제목: {article.get('title', '')}\n"
+                            f"게시일: {article.get('published', '알 수 없음')}\n"
+                            f"분석 자료({article.get('content_type', '제목')}): {content}"
+                        )
+                    combined_news = "\n\n".join(news_blocks)
+                else:
+                    # 본문을 가져오지 못한 경우 기존 제목 분석으로 대체합니다.
+                    combined_news = "\n".join(
+                        [f"[언론사 미확인] {title}" for title in titles[:3]]
+                    )
 
                 prediction_info = (
                     f"LSTM 예측가: 내일 {self.format_price(preds[0], is_krw)}, "
                     f"4일 뒤 {self.format_price(preds[1], is_krw)}, "
                     f"7일 뒤 {self.format_price(preds[2], is_krw)}"
                 )
+                if tabpfn_preds:
+                    prediction_info += (
+                        f"\nTabPFN 예측가: 내일 {self.format_price(tabpfn_preds[0], is_krw)}, "
+                        f"4일 뒤 {self.format_price(tabpfn_preds[1], is_krw)}, "
+                        f"7일 뒤 {self.format_price(tabpfn_preds[2], is_krw)}"
+                    )
 
                 rsi_v         = float(df['RSI'].iloc[-1])
                 trend         = "🔥 과매수" if rsi_v > 70 else ("❄️ 과매도" if rsi_v < 30 else "⚖️ 중립 유지")
@@ -332,28 +393,31 @@ class StockAIAgentV4(StockAIAgentV3):
                 # Step 1: 주식전문가
                 print("   ▶️ [호출] 주식전문가 에이전트 요청 송신 중...")
                 stock_raw   = self.simulator.run_stock_expert(name, current_price_desc, prediction_info)
-                stock_score = self.simulator.parse_score_from_response(stock_raw)
-                stock_opinion = stock_raw.split('{"score"')[0].strip() if stock_raw else "분석 실패"
-                self.save_persona_result(name, "주식전문가", stock_opinion, stock_score)
-                time.sleep(15.0)
+                stock_opinion, stock_score = self.simulator.parse_response(stock_raw)
+                self.save_persona_result(
+                    name, "주식전문가", stock_opinion, stock_score, run_id
+                )
+                time.sleep(self.pause_seconds)
 
                 # Step 2: 뉴스기업전문가
                 print("   ▶️ [호출] 뉴스기업전문가 에이전트 요청 송신 중...")
                 news_raw    = self.simulator.run_news_expert(name, combined_news, company_evaluation)
-                news_score  = self.simulator.parse_score_from_response(news_raw)
-                news_opinion = news_raw.split('{"score"')[0].strip() if news_raw else "분석 실패"
-                self.save_persona_result(name, "뉴스기업전문가", news_opinion, news_score)
-                time.sleep(15.0)
+                news_opinion, news_score = self.simulator.parse_response(news_raw)
+                self.save_persona_result(
+                    name, "뉴스기업전문가", news_opinion, news_score, run_id
+                )
+                time.sleep(self.pause_seconds)
 
                 # Step 3: 최종결정자
                 print("   ▶️ [호출] 최종결정자 에이전트 요청 송신 중...")
                 final_raw   = self.simulator.run_final_decision_maker(
                     name, stock_opinion, stock_score, news_opinion, news_score
                 )
-                final_score   = self.simulator.parse_score_from_response(final_raw)
-                final_opinion = final_raw.split('{"score"')[0].strip() if final_raw else "분석 실패"
-                self.save_persona_result(name, "최종결정자", final_opinion, final_score)
-                time.sleep(15.0)
+                final_opinion, final_score = self.simulator.parse_response(final_raw)
+                self.save_persona_result(
+                    name, "최종결정자", final_opinion, final_score, run_id
+                )
+                time.sleep(self.pause_seconds)
 
                 # ── 리포트 출력 ───────────────
                 print(f"\n{'='*65}")
@@ -362,23 +426,32 @@ class StockAIAgentV4(StockAIAgentV3):
 
                 print(f"📊 현재가: {self.format_price(current_price, is_krw)} | LSTM 예측: {self.format_price(preds[0], is_krw)}")
 
-                print(f"\n🎭 [AI 에이전트 토론 및 최종 결정] (최종 의사결정 점수: {final_score:+.2f})")
+                final_score_text = (
+                    f"{final_score:+.2f}" if final_score is not None else "분석 실패"
+                )
+                print(f"\n🎭 [AI 에이전트 토론 및 최종 결정] (최종 의사결정 점수: {final_score_text})")
 
-                s_color   = "🟢" if stock_score > 0.1 else ("🔴" if stock_score < -0.1 else "⚖️")
+                s_color   = "❌" if stock_score is None else ("🟢" if stock_score > 0.1 else ("🔴" if stock_score < -0.1 else "⚖️"))
                 s_short   = stock_opinion[:80].replace("\n", " ") + "..."
-                print(f"  {s_color} 주식전문가: {stock_score:+.2f}점 | {s_short}")
+                s_score_text = f"{stock_score:+.2f}점" if stock_score is not None else "분석 실패"
+                print(f"  {s_color} 주식전문가: {s_score_text} | {s_short}")
 
-                n_color   = "🟢" if news_score > 0.1 else ("🔴" if news_score < -0.1 else "⚖️")
+                n_color   = "❌" if news_score is None else ("🟢" if news_score > 0.1 else ("🔴" if news_score < -0.1 else "⚖️"))
                 n_short   = news_opinion[:80].replace("\n", " ") + "..."
-                print(f"  {n_color} 뉴스기업전문가: {news_score:+.2f}점 | {n_short}")
+                n_score_text = f"{news_score:+.2f}점" if news_score is not None else "분석 실패"
+                print(f"  {n_color} 뉴스기업전문가: {n_score_text} | {n_short}")
 
-                f_color   = "🟢" if final_score > 0.1 else ("🔴" if final_score < -0.1 else "⚖️")
+                f_color   = "❌" if final_score is None else ("🟢" if final_score > 0.1 else ("🔴" if final_score < -0.1 else "⚖️"))
                 f_short   = final_opinion[:120].replace("\n", " ") + "..."
-                print(f"  {f_color} 최종결정자: {final_score:+.2f}점 | {f_short}")
+                f_score_text = f"{final_score:+.2f}점" if final_score is not None else "분석 실패"
+                print(f"  {f_color} 최종결정자: {f_score_text} | {f_short}")
 
-                final_adjusted_price = current_price * (1 + (final_score * 0.03))
                 print(f"\n🔮 예측 결과 및 백테스트 데이터")
-                print(f"  - 에이전트 최종합의 예측가: {self.format_price(final_adjusted_price, is_krw)}")
+                if final_score is not None:
+                    final_adjusted_price = current_price * (1 + (final_score * 0.03))
+                    print(f"  - 에이전트 최종합의 예측가: {self.format_price(final_adjusted_price, is_krw)}")
+                else:
+                    print("  - 에이전트 최종합의 예측가: 분석 실패")
                 print(f"  - 전략 과거 수익률: {bt_ret:.2f}%")
                 print(f"{'='*65}\n")
 
@@ -391,9 +464,6 @@ class StockAIAgentV4(StockAIAgentV3):
 # 단독 실행
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
-    # ⚠️ 본체 서버의 실제 IP 주소를 입력하세요.
-    # 같은 PC라면 "127.0.0.1", 원격 서버라면 실제 IP 
-    MY_MAIN_SERVER_IP = "125.134.170.132"
-
-    agent = StockAIAgentV4(server_ip=MY_MAIN_SERVER_IP)
+    ollama_host = os.environ.get("OLLAMA_HOST", '125.134.140.98')
+    agent = StockAIAgentV4(server_ip=ollama_host)
     agent.run()

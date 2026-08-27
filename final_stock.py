@@ -14,28 +14,18 @@ final_stock.py
 [단독 실행 시] python final_stock.py
 """
 
-import sqlite3
 import pandas as pd
 from datetime import datetime
 
-DB_PATH = "stock_analysis.db"
+from database import DB_PATH, connect_db, table_exists
 
 
 # ──────────────────────────────────────────────
 # 헬퍼 함수
 # ──────────────────────────────────────────────
-def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
+def get_connection(db_path: str = DB_PATH):
     """SQLite 연결 객체를 반환합니다."""
-    return sqlite3.connect(db_path)
-
-
-def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
-    """테이블 존재 여부를 확인합니다."""
-    cur = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-        (table_name,)
-    )
-    return cur.fetchone() is not None
+    return connect_db(db_path)
 
 
 # ──────────────────────────────────────────────
@@ -149,8 +139,11 @@ def show_final_summary():
         df_latest = df.drop_duplicates(subset=['ticker_name'], keep='first')
 
         for _, row in df_latest.iterrows():
-            score = float(row['score'])
-            if score > 0.1:
+            raw_score = row['score']
+            score = float(raw_score) if pd.notna(raw_score) else None
+            if score is None:
+                emoji = "❌ 분석 실패"
+            elif score > 0.1:
                 emoji = "🟢 매수 우세"
             elif score < -0.1:
                 emoji = "🔴 매도 우세"
@@ -158,7 +151,8 @@ def show_final_summary():
                 emoji = "⚖️ 중립"
 
             print(f"\n📌 [{row['ticker_name']}]  |  {row['timestamp']}")
-            print(f"   최종 점수: {score:+.2f}  →  {emoji}")
+            score_text = f"{score:+.2f}" if score is not None else "없음"
+            print(f"   최종 점수: {score_text}  →  {emoji}")
             print(f"   의견 요약: {str(row['opinion'])[:120]}...")
 
     finally:
@@ -168,8 +162,11 @@ def show_final_summary():
 # ──────────────────────────────────────────────
 # 4. 실패 로그 정리
 # ──────────────────────────────────────────────
-def clean_failed_logs():
-    """persona_discussion_log 에서 opinion = '분석 실패' 데이터를 삭제합니다."""
+def clean_failed_logs(confirm: bool = False):
+    """명시적으로 확인한 경우에만 실패로 기록된 데이터를 삭제합니다."""
+    if not confirm:
+        print("⚠️  clean_failed_logs(confirm=True) 로 호출해야 실행됩니다.")
+        return
     print(f"\n{'='*65}")
     print("🧹 [실패 로그 정리]")
     print(f"{'='*65}")
@@ -182,7 +179,11 @@ def clean_failed_logs():
             return
 
         cursor.execute(
-            "DELETE FROM persona_discussion_log WHERE opinion = '분석 실패'"
+            """
+            DELETE FROM persona_discussion_log
+            WHERE score IS NULL OR opinion LIKE '분석 실패:%'
+               OR opinion = '분석 실패' OR opinion IS NULL OR TRIM(opinion) = ''
+            """
         )
         conn.commit()
         print(f"✅ 삭제 완료! 총 {cursor.rowcount}개의 실패 로그가 정리되었습니다.")

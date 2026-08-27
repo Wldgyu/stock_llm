@@ -23,10 +23,21 @@ import yfinance as yf
 import feedparser
 import matplotlib.pyplot as plt
 
+try:
+    import trafilatura
+    from googlenewsdecoder import gnewsdecoder
+    ARTICLE_EXTRACTION_AVAILABLE = True
+except ImportError:
+    trafilatura = None
+    gnewsdecoder = None
+    ARTICLE_EXTRACTION_AVAILABLE = False
+
 import torch
 import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 from transformers import pipeline
+
+from database import DB_PATH, connect_db
 
 # ── TabPFN / HuggingFace 인증 자동 로드 ──────────────────────
 import os as _os, re as _re, pathlib as _pl
@@ -92,8 +103,18 @@ def _hf_login_from_file(filename: str = "tabpfn_api.txt") -> bool:
         print(f"⚠️ HuggingFace 로그인 실패: {e}")
         return False
 
-_load_tabpfn_token()
-_hf_login_from_file()
+_AUTH_INITIALIZED = False
+
+
+def _ensure_model_auth():
+    """TabPFN을 실제 사용할 때만 로컬 인증정보를 읽습니다."""
+    global _AUTH_INITIALIZED
+    if _AUTH_INITIALIZED:
+        return
+    tabpfn_ready = _load_tabpfn_token()
+    huggingface_ready = _hf_login_from_file()
+    # 둘 다 실패하면 다음 종목에서 다시 시도할 수 있도록 False를 유지합니다.
+    _AUTH_INITIALIZED = tabpfn_ready or huggingface_ready
 
 # TabPFN (Google PriorLabs) - 테이블형 데이터 Transformer 기반 회귀 모델
 try:
@@ -140,18 +161,32 @@ class LSTMModel(nn.Module):
     입력: (batch, seq_len, input_dim)
     출력: (batch, output_dim=3)  → [T+1, T+4, T+7] 예측
     """
-    def __init__(self, input_dim, hidden_dim, num_layers, output_dim=3):
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim,
+        num_layers,
+        output_dim=3,
+        dropout=0.2,
+    ):
         super(LSTMModel, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.lstm = nn.LSTM(
+            input_dim,
+            hidden_dim,
+            num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.dropout = nn.Dropout(dropout)
         self.fc   = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
         c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
         out, _ = self.lstm(x, (h0, c0))
-        return self.fc(out[:, -1, :])
+        return self.fc(self.dropout(out[:, -1, :]))
 
 
 # ──────────────────────────────────────────────
@@ -180,6 +215,8 @@ class StockAIAgentV3:
             # "알파벳": "GOOGL",
             # "브로드컴": "AVGO",
         }
+        self.db_path = DB_PATH
+        self._init_analysis_db()
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # 영문 감성 분석 모델 (FinBERT)
@@ -194,6 +231,111 @@ class StockAIAgentV3:
             model="daekeun-ml/koelectra-small-v3-nsmc",
             device=self.device
         )
+
+    def _init_analysis_db(self):
+        """웹 대시보드가 읽는 ML 분석 이력 테이블을 준비합니다."""
+        conn = connect_db(self.db_path)
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS analysis_log (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp   TEXT,
+                    name        TEXT,
+                    symbol      TEXT,
+                    last_close  REAL,
+                    rsi         REAL,
+                    trend       TEXT,
+                    support     REAL,
+                    resistance  REAL,
+                    usd_krw     REAL,
+                    sox         REAL,
+                    sentiment   REAL,
+                    sent_label  TEXT,
+                    pred_low    REAL,
+                    pred_high   REAL,
+                    risk_score  INTEGER
+                )
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _save_analysis_result(self, name: str, result: dict):
+        """한 번 계산한 분석 결과를 중복 계산 없이 DB에 저장합니다."""
+        df = result["df"]
+        rsi = float(df["RSI"].dropna().iloc[-1])
+        trend = "과매수" if rsi > 70 else ("과매도" if rsi < 30 else "중립")
+        sentiment = float(result["sentiment"])
+        sent_label = "긍정" if sentiment > 0.05 else ("부정" if sentiment < -0.05 else "중립")
+        predictions = [float(value) for value in result["preds"]]
+        recent = df.tail(20)
+        volatility = float(df["Close"].pct_change().std() * np.sqrt(252) * 100)
+        risk_score = min(10, max(1, int(round(volatility / 5))))
+
+        values = (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            name,
+            result["symbol"],
+            float(df["Close"].iloc[-1]),
+            rsi,
+            trend,
+            float(recent["Low"].min()),
+            float(recent["High"].max()),
+            float(df["USD_KRW"].iloc[-1]),
+            float(df["SOX_Index"].iloc[-1]),
+            sentiment,
+            sent_label,
+            min(predictions),
+            max(predictions),
+            risk_score,
+        )
+        conn = connect_db(self.db_path)
+        try:
+            conn.execute("""
+                INSERT INTO analysis_log (
+                    timestamp, name, symbol, last_close, rsi, trend,
+                    support, resistance, usd_krw, sox, sentiment,
+                    sent_label, pred_low, pred_high, risk_score
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, values)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _analyze_stock(self, name: str, symbol: str):
+        """단일 종목의 모든 ML 계산을 한 번 수행하고 저장합니다."""
+        df = self.fetch_data(symbol)
+        if df is None or len(df) < 30:
+            print(f"⚠️ {name}: 데이터 부족, 건너뜁니다.")
+            return None
+
+        df["RSI"] = ta.rsi(df["Close"], length=14)
+        bt_ret = self.backtest(df)
+        sharpe, mdd = self.calculate_performance_metrics(df)
+        sentiment, titles = self.get_realtime_sentiment(name)
+        news_articles = self.get_financial_news_articles(name, symbol)
+        preds, model, last_seq, lstm_metrics = self.predict_multi_step(df)
+        tabpfn_preds, tabpfn_metrics = self.predict_tabpfn(df)
+
+        result = {
+            "df": df,
+            "symbol": symbol,
+            "bt_ret": bt_ret,
+            "sharpe": sharpe,
+            "mdd": mdd,
+            "sentiment": sentiment,
+            "titles": titles,
+            "news_articles": news_articles,
+            "preds": preds,
+            "tabpfn_preds": tabpfn_preds,
+            "lstm_metrics": lstm_metrics,
+            "tabpfn_metrics": tabpfn_metrics,
+            "model": model,
+            "l_seq": last_seq,
+        }
+        self._save_analysis_result(name, result)
+        print(f"✅ [{name}] ML 분석 및 DB 저장 완료.")
+        return result
 
     # ── 데이터 수집 ──────────────────────────
     def fetch_data(self, symbol: str):
@@ -214,8 +356,8 @@ class StockAIAgentV3:
                 m_data = m_data.iloc[:, 0]
             df[col_name] = m_data
 
-        # 결측치 처리: 앞뒤 채우기 후 남은 행 제거
-        df = df.ffill().bfill().dropna()
+        # 과거 값으로만 채워 미래 데이터가 과거 행에 들어가는 누수를 막습니다.
+        df = df.ffill().dropna()
         return df
 
     # ── 뉴스 감성 분석 ────────────────────────
@@ -243,6 +385,87 @@ class StockAIAgentV3:
 
         avg_score = sum(scores) / len(scores) if scores else 0.0
         return avg_score, titles
+
+    def get_financial_news_articles(self, name: str, symbol: str):
+        """지정 금융 언론사별 최신 기사 한 건의 접근 가능한 본문을 수집합니다."""
+        sources = {
+            "Bloomberg": ("Bloomberg",),
+            "Wall Street Journal": ("WSJ", "The Wall Street Journal", "Wall Street Journal"),
+            "Financial Times": ("Financial Times",),
+            "Reuters": ("Reuters",),
+        }
+        query_names = {
+            "삼성전자": "Samsung Electronics",
+            "엔비디아": "NVIDIA",
+            "인텔": "Intel",
+        }
+        company_query = query_names.get(name, symbol.split(".")[0])
+        articles = []
+
+        for display_source, accepted_names in sources.items():
+            source_query = accepted_names[0]
+            encoded_query = urllib.parse.quote(
+                f'{company_query} source:"{source_query}" when:14d'
+            )
+            url = (
+                "https://news.google.com/rss/search"
+                f"?q={encoded_query}&hl=en-US&gl=US&ceid=US:en"
+            )
+            rss = feedparser.parse(url)
+            entry = next(
+                (
+                    item
+                    for item in rss.entries
+                    if getattr(getattr(item, "source", {}), "title", "")
+                    in accepted_names
+                ),
+                None,
+            )
+            if entry is None:
+                continue
+
+            article_url = entry.link
+            body = ""
+            content_type = "제목"
+            if ARTICLE_EXTRACTION_AVAILABLE:
+                try:
+                    decoded = gnewsdecoder(entry.link, interval=0.2)
+                    if decoded.get("status"):
+                        article_url = decoded["decoded_url"]
+                        downloaded = trafilatura.fetch_url(article_url)
+                        if downloaded:
+                            body = trafilatura.extract(
+                                downloaded,
+                                include_comments=False,
+                                include_tables=False,
+                            ) or ""
+                            if len(body) >= 200:
+                                content_type = "본문"
+                            else:
+                                metadata = trafilatura.extract_metadata(downloaded)
+                                description = (
+                                    metadata.description if metadata else ""
+                                )
+                                if description:
+                                    body = description
+                                    content_type = "기사 요약"
+                except Exception as exc:
+                    print(f"      ⚠️ {display_source} 본문 수집 실패: {exc}")
+
+            # LLM 입력이 너무 커지지 않도록 기사당 본문 길이를 제한합니다.
+            body = " ".join(body.split())[:2500]
+            articles.append(
+                {
+                    "source": display_source,
+                    "title": entry.title,
+                    "published": getattr(entry, "published", ""),
+                    "url": article_url,
+                    "body": body,
+                    "content_type": content_type,
+                }
+            )
+
+        return articles
 
     # ── 성과 지표 ─────────────────────────────
     def calculate_performance_metrics(self, df: pd.DataFrame):
@@ -279,69 +502,217 @@ class StockAIAgentV3:
         final_val = bal + (pos * float(df['Close'].iloc[-1]))
         return ((final_val - init_bal) / init_bal) * 100
 
+    # ── 모델 검증 공통 함수 ────────────────────
+    @staticmethod
+    def _regression_metrics(y_true, y_pred):
+        """실제값과 예측값의 평균 오차를 계산합니다."""
+        y_true = np.asarray(y_true, dtype=np.float64)
+        y_pred = np.asarray(y_pred, dtype=np.float64)
+
+        def calculate(actual, predicted):
+            error = predicted - actual
+            safe_actual = np.where(np.abs(actual) < 1e-8, 1e-8, np.abs(actual))
+            return {
+                "mae": float(np.mean(np.abs(error))),
+                "rmse": float(np.sqrt(np.mean(error ** 2))),
+                "mape": float(np.mean(np.abs(error) / safe_actual) * 100),
+            }
+
+        result = calculate(y_true, y_pred)
+        if y_true.ndim == 2 and y_true.shape[1] == 3:
+            # 각 예측 시점의 성능도 따로 확인할 수 있게 보관합니다.
+            result["by_horizon"] = {
+                label: calculate(y_true[:, index], y_pred[:, index])
+                for index, label in enumerate(("T+1", "T+4", "T+7"))
+            }
+        return result
+
+    # max_epochs=200: 조기 종료가 없을 때 실행할 최대 학습 횟수입니다.
+    def _train_lstm(self, X_train, y_train, X_val=None, y_val=None, max_epochs=200):
+        """LSTM을 학습하고 검증 손실이 개선되지 않으면 일찍 종료합니다."""
+        # ── 직접 조정하기 쉬운 LSTM 학습 설정 ──
+        learning_rate = 0.005  # 학습률: 불안정하면 낮추고, 너무 느리면 조금 높입니다.
+        batch_size = 16        # 배치 크기: 작을수록 세밀하지만 학습 시간이 늘어납니다.
+        dropout_rate = 0.2     # 과적합 조절: 과적합이 크면 값을 조금 높입니다.
+        huber_delta = 1.0      # 이상치 민감도: 작을수록 급등락의 영향을 덜 받습니다.
+        gradient_clip = 1.0    # 기울기 제한: 학습 중 값이 폭주하는 것을 막습니다.
+        patience = 12          # 조기 종료: 검증 손실 개선을 기다리는 epoch 수입니다.
+
+        model = LSTMModel(3, 64, 2, 3, dropout=dropout_rate).to(self.device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+        # Huber 손실은 급등락 같은 이상치가 학습을 과도하게 흔드는 것을 줄입니다.
+        criterion = nn.HuberLoss(delta=huber_delta)
+        best_state = None
+        best_loss = float("inf")
+        best_epoch = max_epochs
+        wait = 0
+
+        for epoch in range(max_epochs):
+            model.train()
+            indices = torch.randperm(X_train.size(0), device=X_train.device)
+            for start in range(0, X_train.size(0), batch_size):
+                batch_indices = indices[start:start + batch_size]
+                batch_X = X_train[batch_indices]
+                batch_y = y_train[batch_indices]
+
+                optimizer.zero_grad()
+                loss = criterion(model(batch_X), batch_y)
+                loss.backward()
+                # LSTM의 기울기가 갑자기 커지는 현상을 제한합니다.
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=gradient_clip
+                )
+                optimizer.step()
+
+            # 검증 데이터가 있을 때만 조기 종료 여부를 확인합니다.
+            if X_val is None:
+                continue
+            model.eval()
+            with torch.no_grad():
+                val_loss = float(criterion(model(X_val), y_val).item())
+            if val_loss < best_loss - 1e-6:
+                best_loss = val_loss
+                best_epoch = epoch + 1
+                best_state = {
+                    key: value.detach().cpu().clone()
+                    for key, value in model.state_dict().items()
+                }
+                wait = 0
+            else:
+                wait += 1
+                if wait >= patience:
+                    break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+        return model, best_epoch
+
     # ── LSTM 예측 ─────────────────────────────
     def predict_multi_step(self, df: pd.DataFrame):
         """
-        StandardScaler + LSTM 으로 T+1, T+4, T+7 종가를 예측합니다.
-        Returns: (preds: list[float], model: LSTMModel, last_seq: Tensor)
+        시간순 70/15/15 분리 후 LSTM의 T+1, T+4, T+7 성능을 검증합니다.
+        검증이 끝나면 전체 데이터로 최종 모델을 다시 학습해 미래를 예측합니다.
         """
-        data    = df[['Close', 'USD_KRW', 'SOX_Index']].values
-        scaler  = StandardScaler()
-        scaled  = scaler.fit_transform(data)
-        seq_len = 20
+        np.random.seed(42)
+        torch.manual_seed(42)
 
-        X, y = [], []
-        for i in range(len(scaled) - seq_len - 7):
-            X.append(scaled[i:i + seq_len])
-            y.append([
-                scaled[i + seq_len,     0],
-                scaled[i + seq_len + 3, 0],
-                scaled[i + seq_len + 6, 0],
+        data = df[['Close', 'USD_KRW', 'SOX_Index']].values.astype(np.float32)
+        seq_len = 20
+        train_end = int(len(data) * 0.70)
+        val_end = int(len(data) * 0.85)
+        if train_end <= seq_len + 7 or len(data) - val_end < 8:
+            raise ValueError("LSTM 학습/검증/테스트 분리에 필요한 데이터가 부족합니다.")
+
+        # 데이터 누수를 막기 위해 평가용 스케일러는 학습 구간에만 맞춥니다.
+        eval_scaler = StandardScaler()
+        eval_scaler.fit(data[:train_end])
+        scaled = eval_scaler.transform(data)
+
+        split_X = {"train": [], "val": [], "test": []}
+        split_y = {"train": [], "val": [], "test": []}
+        for start in range(len(scaled) - seq_len - 6):
+            target_first = start + seq_len
+            target_last = target_first + 6
+            if target_last < train_end:
+                split = "train"
+            elif target_first >= train_end and target_last < val_end:
+                split = "val"
+            elif target_first >= val_end:
+                split = "test"
+            else:
+                # 두 구간의 경계에 걸친 정답은 평가가 섞이지 않도록 제외합니다.
+                continue
+            split_X[split].append(scaled[start:start + seq_len])
+            split_y[split].append([
+                scaled[target_first, 0],
+                scaled[target_first + 3, 0],
+                scaled[target_first + 6, 0],
             ])
 
-        X = torch.FloatTensor(np.array(X)).to(self.device)
-        y = torch.FloatTensor(np.array(y)).to(self.device)
+        if any(not split_X[name] for name in ("train", "val", "test")):
+            raise ValueError("LSTM 분할 후 비어 있는 데이터 구간이 있습니다.")
 
-        model     = LSTMModel(3, 64, 2, 3).to(self.device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+        tensors = {}
+        for split in ("train", "val", "test"):
+            tensors[f"X_{split}"] = torch.tensor(
+                np.asarray(split_X[split]), dtype=torch.float32, device=self.device
+            )
+            tensors[f"y_{split}"] = torch.tensor(
+                np.asarray(split_y[split]), dtype=torch.float32, device=self.device
+            )
 
-        model.train()
-        for _ in range(50):
-            optimizer.zero_grad()
-            loss = nn.MSELoss()(model(X), y)
-            loss.backward()
-            optimizer.step()
-
-        model.eval()
-        last_seq = torch.FloatTensor(scaled[-seq_len:]).unsqueeze(0).to(self.device)
+        # 학습 70%와 검증 15%로 적절한 epoch 수를 선택합니다.
+        eval_model, best_epoch = self._train_lstm(
+            tensors["X_train"],
+            tensors["y_train"],
+            tensors["X_val"],
+            tensors["y_val"],
+        )
+        eval_model.eval()
         with torch.no_grad():
-            preds_scaled = model(last_seq).cpu().numpy()[0]
+            val_pred_scaled = eval_model(tensors["X_val"]).cpu().numpy()
+            test_pred_scaled = eval_model(tensors["X_test"]).cpu().numpy()
+        val_true_scaled = tensors["y_val"].cpu().numpy()
+        test_true_scaled = tensors["y_test"].cpu().numpy()
 
-        final_preds = []
-        for p in preds_scaled:
-            dummy       = np.zeros((1, 3))
-            dummy[0, 0] = p
-            final_preds.append(float(scaler.inverse_transform(dummy)[0, 0]))
+        # 정규화된 종가를 실제 가격 단위로 되돌려 오차를 계산합니다.
+        close_scale = eval_scaler.scale_[0]
+        close_mean = eval_scaler.mean_[0]
+        to_price = lambda values: (values * close_scale) + close_mean
+        metrics = {
+            "validation": self._regression_metrics(
+                to_price(val_true_scaled), to_price(val_pred_scaled)
+            ),
+            "test": self._regression_metrics(
+                to_price(test_true_scaled), to_price(test_pred_scaled)
+            ),
+            "best_epoch": best_epoch,
+            "split_samples": {
+                split: len(split_X[split])
+                for split in ("train", "val", "test")
+            },
+        }
 
-        return final_preds, model, last_seq
+        # 실제 미래 예측은 최신 정보까지 활용하도록 전체 데이터로 다시 학습합니다.
+        final_scaler = StandardScaler()
+        final_scaled = final_scaler.fit_transform(data)
+        final_X, final_y = [], []
+        for start in range(len(final_scaled) - seq_len - 6):
+            target = start + seq_len
+            final_X.append(final_scaled[start:start + seq_len])
+            final_y.append([
+                final_scaled[target, 0],
+                final_scaled[target + 3, 0],
+                final_scaled[target + 6, 0],
+            ])
+        X_all = torch.tensor(np.asarray(final_X), dtype=torch.float32, device=self.device)
+        y_all = torch.tensor(np.asarray(final_y), dtype=torch.float32, device=self.device)
+        final_model, _ = self._train_lstm(
+            X_all, y_all, max_epochs=max(1, best_epoch)
+        )
+
+        final_model.eval()
+        last_seq = torch.tensor(
+            final_scaled[-seq_len:], dtype=torch.float32, device=self.device
+        ).unsqueeze(0)
+        with torch.no_grad():
+            preds_scaled = final_model(last_seq).cpu().numpy()[0]
+        final_preds = (
+            preds_scaled * final_scaler.scale_[0] + final_scaler.mean_[0]
+        ).astype(float).tolist()
+        return final_preds, final_model, last_seq, metrics
 
     # ── TabPFN 예측 ───────────────────────────
     def predict_tabpfn(self, df: pd.DataFrame):
         """
-        Google PriorLabs TabPFNRegressor 로 T+1, T+4, T+7 종가를 예측합니다.
-
-        피처: Close, USD_KRW, SOX_Index, RSI, EMA20, Volume
-        방법: 슬라이딩 윈도우(look_back=10) 로 테이블형 X/y 생성 후
-              TabPFN fit → T+1 예측, 피처 롤링으로 T+4/T+7 재귀 추정.
-
-        Returns:
-            list[float]: [T+1, T+4, T+7] 예측 종가,
-            또는 TabPFN 미설치 시 None
+        시간순 70/15/15 분리로 TabPFN의 성능을 검증합니다.
+        T+1, T+4, T+7은 각각 별도 회귀 모델로 직접 예측합니다.
         """
         if not TABPFN_AVAILABLE:
-            return None
+            return None, None
 
         try:
+            _ensure_model_auth()
             # ── 피처 준비 ──────────────────────
             tdf = df.copy()
             tdf['EMA20']  = ta.ema(tdf['Close'], length=20)
@@ -352,66 +723,91 @@ class StockAIAgentV3:
             feat_cols = ['Close', 'USD_KRW', 'SOX_Index', 'RSI', 'EMA20', 'Volume']
             look_back = 10   # 과거 N일을 피처로 사용
 
-            # ── 슬라이딩 윈도우 데이터셋 생성 ──
-            rows_X, rows_y = [], []
-            for i in range(look_back, len(tdf) - 1):
+            train_end = int(len(tdf) * 0.70)
+            val_end = int(len(tdf) * 0.85)
+            split_X = {"train": [], "val": [], "test": []}
+            split_y = {"train": [], "val": [], "test": []}
+            all_X, all_y = [], []
+
+            # 과거 10일을 입력으로 만들고 세 미래 시점의 종가를 정답으로 둡니다.
+            for i in range(look_back, len(tdf) - 6):
                 window = tdf[feat_cols].iloc[i - look_back:i].values.flatten()
-                rows_X.append(window)
-                rows_y.append(float(tdf['Close'].iloc[i]))   # 다음날 종가
+                targets = [
+                    float(tdf['Close'].iloc[i]),
+                    float(tdf['Close'].iloc[i + 3]),
+                    float(tdf['Close'].iloc[i + 6]),
+                ]
+                all_X.append(window)
+                all_y.append(targets)
 
-            X_arr = np.array(rows_X, dtype=np.float32)
-            y_arr = np.array(rows_y, dtype=np.float32)
+                target_last = i + 6
+                if target_last < train_end:
+                    split = "train"
+                elif i >= train_end and target_last < val_end:
+                    split = "val"
+                elif i >= val_end:
+                    split = "test"
+                else:
+                    # T+7 정답이 다음 구간에 걸치면 누수를 막기 위해 제외합니다.
+                    continue
+                split_X[split].append(window)
+                split_y[split].append(targets)
 
-            # TabPFN 권장 최대 샘플 수 제한 (속도/안정성)
-            MAX_TRAIN = 1000
-            if len(X_arr) > MAX_TRAIN:
-                X_arr = X_arr[-MAX_TRAIN:]
-                y_arr = y_arr[-MAX_TRAIN:]
+            if any(not split_X[name] for name in ("train", "val", "test")):
+                raise ValueError("TabPFN 분할 후 비어 있는 데이터 구간이 있습니다.")
 
-            # 마지막 행은 예측용, 나머지는 학습
-            X_train, y_train = X_arr[:-1], y_arr[:-1]
-            X_pred           = X_arr[[-1]]
+            # TabPFN 권장 한도보다 많으면 각 구간의 최신 샘플을 사용합니다.
+            max_samples = 1000
+            arrays = {}
+            for split in ("train", "val", "test"):
+                arrays[f"X_{split}"] = np.asarray(
+                    split_X[split][-max_samples:], dtype=np.float32
+                )
+                arrays[f"y_{split}"] = np.asarray(
+                    split_y[split][-max_samples:], dtype=np.float32
+                )
+            X_train, y_train = arrays["X_train"], arrays["y_train"]
+            X_val, y_val = arrays["X_val"], arrays["y_val"]
+            X_test, y_test = arrays["X_test"], arrays["y_test"]
 
-            # ── TabPFN fit / predict ───────────
-            reg = TabPFNRegressor()
-            reg.fit(X_train, y_train)
+            # 평가 모델은 학습 구간만 보고 검증·테스트 구간을 예측합니다.
+            val_predictions = np.zeros_like(y_val)
+            test_predictions = np.zeros_like(y_test)
+            for horizon in range(3):
+                reg = TabPFNRegressor()
+                reg.fit(X_train, y_train[:, horizon])
+                val_predictions[:, horizon] = reg.predict(X_val)
+                test_predictions[:, horizon] = reg.predict(X_test)
 
-            pred_t1 = float(reg.predict(X_pred)[0])
+            metrics = {
+                "validation": self._regression_metrics(y_val, val_predictions),
+                "test": self._regression_metrics(y_test, test_predictions),
+                "split_samples": {
+                    "train": len(X_train),
+                    "val": len(X_val),
+                    "test": len(X_test),
+                },
+            }
 
-            # T+4, T+7: 피처의 Close 자리만 재귀 업데이트하여 추정
-            def _next_pred(reg, last_window_flat, new_close, n_feat):
-                """Close 를 갱신한 새 윈도우로 다음 예측값 반환."""
-                window_2d = last_window_flat.reshape(look_back, n_feat).copy()
-                # 윈도우를 한 칸 밀고 맨 마지막 행의 Close(인덱스 0) 갱신
-                window_2d = np.roll(window_2d, -1, axis=0)
-                window_2d[-1, 0] = new_close
-                return float(reg.predict(window_2d.reshape(1, -1))[0])
+            # 최종 예측 모델은 검증이 끝난 뒤 전체 과거 데이터를 사용합니다.
+            latest_window = (
+                tdf[feat_cols].iloc[-look_back:].values
+                .astype(np.float32)
+                .reshape(1, -1)
+            )
+            X_arr = np.asarray(all_X[-max_samples:], dtype=np.float32)
+            y_arr = np.asarray(all_y[-max_samples:], dtype=np.float32)
+            final_predictions = []
+            for horizon in range(3):
+                reg = TabPFNRegressor()
+                reg.fit(X_arr, y_arr[:, horizon])
+                final_predictions.append(float(reg.predict(latest_window)[0]))
 
-            n_feat   = len(feat_cols)
-            last_win = X_pred[0]           # shape: (look_back * n_feat,)
-
-            # T+2, T+3, T+4 순차 추정
-            cur_close = pred_t1
-            for _ in range(3):
-                cur_close = _next_pred(reg, last_win, cur_close, n_feat)
-                last_win  = np.roll(last_win.reshape(look_back, n_feat), -1, axis=0)
-                last_win[-1, 0] = cur_close
-                last_win = last_win.flatten()
-            pred_t4 = cur_close
-
-            # T+5, T+6, T+7 순차 추정
-            for _ in range(3):
-                cur_close = _next_pred(reg, last_win, cur_close, n_feat)
-                last_win  = np.roll(last_win.reshape(look_back, n_feat), -1, axis=0)
-                last_win[-1, 0] = cur_close
-                last_win = last_win.flatten()
-            pred_t7 = cur_close
-
-            return [pred_t1, pred_t4, pred_t7]
+            return final_predictions, metrics
 
         except Exception as e:
             print(f"      ⚠️ TabPFN 예측 실패: {e}")
-            return None
+            return None, None
 
     # ── 피처 중요도 ───────────────────────────
     def get_feature_importance(self, model, last_seq) -> dict:
@@ -443,18 +839,22 @@ class StockAIAgentV3:
         """모든 종목에 대해 ML 분석 리포트를 콘솔에 출력합니다."""
         for name, symbol in self.tickers.items():
             try:
-                df = self.fetch_data(symbol)
-                if df is None or len(df) < 30:
+                result = self._analyze_stock(name, symbol)
+                if not result:
                     continue
 
-                # RSI를 원본 df에 직접 계산 (backtest는 df.copy()로 동작)
-                df['RSI'] = ta.rsi(df['Close'], length=14)
-
-                bt_ret              = self.backtest(df)
-                sharpe, mdd         = self.calculate_performance_metrics(df)
-                sentiment, titles   = self.get_realtime_sentiment(name)
-                preds, model, l_seq = self.predict_multi_step(df)
-                imp                 = self.get_feature_importance(model, l_seq)
+                df = result["df"]
+                bt_ret = result["bt_ret"]
+                sharpe = result["sharpe"]
+                mdd = result["mdd"]
+                sentiment = result["sentiment"]
+                titles = result["titles"]
+                news_articles = result["news_articles"]
+                preds = result["preds"]
+                tabpfn_preds = result["tabpfn_preds"]
+                lstm_metrics = result["lstm_metrics"]
+                tabpfn_metrics = result["tabpfn_metrics"]
+                imp = self.get_feature_importance(result["model"], result["l_seq"])
                 chart_file          = self.visualize_shap(name, imp)
 
                 print(f"{'='*65}")
@@ -468,17 +868,32 @@ class StockAIAgentV3:
                 print(f"📊 현재가: {last_p:,.0f} | 추세: {trend} (RSI: {rsi_v:.2f})")
                 print(f"📈 전략 수익률: {bt_ret:.2f}% | Sharpe: {sharpe:.2f} | MDD: {mdd:.2f}%")
                 print(f"📰 뉴스 심리: {'긍정' if sentiment > 0.05 else '부정'} (Score: {sentiment:.2f})")
-                for i, t in enumerate(titles[:2]):
-                    print(f"      {i+1}. {t[:50]}...")
+                if news_articles:
+                    for article in news_articles:
+                        print(
+                            f"      [{article['source']}] "
+                            f"{article['content_type']} 분석 | {article['title'][:60]}..."
+                        )
+                else:
+                    for i, title in enumerate(titles[:2]):
+                        print(f"      {i+1}. {title[:50]}...")
 
                 # ── LSTM 예측 출력 ──
                 print(f"🔮 [LSTM]   예보: [내일] {preds[0]:,.2f} | [4일뒤] {preds[1]:,.2f} | [7일뒤] {preds[2]:,.2f}")
+                lstm_test = lstm_metrics["test"]
+                print(
+                    f"   ✅ 평가 모델 테스트 오차: MAE {lstm_test['mae']:,.2f} | "
+                    f"RMSE {lstm_test['rmse']:,.2f} | MAPE {lstm_test['mape']:.2f}%"
+                )
 
                 # ── TabPFN 예측 출력 ──
-                print(f"   🤖 TabPFN 예측 중...")
-                tabpfn_preds = self.predict_tabpfn(df)
                 if tabpfn_preds:
                     print(f"🔮 [TabPFN] 예보: [내일] {tabpfn_preds[0]:,.2f} | [4일뒤] {tabpfn_preds[1]:,.2f} | [7일뒤] {tabpfn_preds[2]:,.2f}")
+                    tabpfn_test = tabpfn_metrics["test"]
+                    print(
+                        f"   ✅ 평가 모델 테스트 오차: MAE {tabpfn_test['mae']:,.2f} | "
+                        f"RMSE {tabpfn_test['rmse']:,.2f} | MAPE {tabpfn_test['mape']:.2f}%"
+                    )
                     diff1 = tabpfn_preds[0] - preds[0]
                     print(f"   📐 모델 차이(T+1): {diff1:+,.2f} ({'TabPFN 높음' if diff1 > 0 else 'LSTM 높음'})")
                 else:
@@ -508,6 +923,9 @@ class StockAIAgentV3:
                     "sentiment": float,
                     "titles": list[str],
                     "preds": list[float],
+                    "tabpfn_preds": list[float] | None,
+                    "lstm_metrics": dict,
+                    "tabpfn_metrics": dict | None,
                     "model": LSTMModel,
                     "l_seq": Tensor,
                 }
@@ -516,36 +934,9 @@ class StockAIAgentV3:
         results = {}
         for name, symbol in self.tickers.items():
             try:
-                df = self.fetch_data(symbol)
-                if df is None or len(df) < 30:
-                    print(f"⚠️ {name}: 데이터 부족, 건너뜁니다.")
-                    continue
-
-                # RSI를 원본 df에 직접 계산 (backtest는 df.copy()로 동작)
-                df['RSI'] = ta.rsi(df['Close'], length=14)
-
-                bt_ret              = self.backtest(df)
-                sharpe, mdd         = self.calculate_performance_metrics(df)
-                sentiment, titles   = self.get_realtime_sentiment(name)
-                preds, model, l_seq = self.predict_multi_step(df)
-                tabpfn_preds        = self.predict_tabpfn(df)
-
-                results[name] = {
-                    "df":           df,
-                    "symbol":       symbol,
-                    "bt_ret":       bt_ret,
-                    "sharpe":       sharpe,
-                    "mdd":          mdd,
-                    "sentiment":    sentiment,
-                    "titles":       titles,
-                    "preds":        preds,
-                    "tabpfn_preds": tabpfn_preds,   # TabPFN 예측 [T+1, T+4, T+7] or None
-                    "model":        model,
-                    "l_seq":        l_seq,
-                }
-                print(f"✅ [{name}] ML 분석 완료.")
-
-
+                result = self._analyze_stock(name, symbol)
+                if result:
+                    results[name] = result
             except Exception as e:
                 print(f"❌ {name} ML 분석 실패: {e}")
                 traceback.print_exc()

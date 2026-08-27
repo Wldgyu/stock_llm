@@ -6,40 +6,33 @@ delete_sqlite.py
 
 [삭제 기준]
   persona_discussion_log 테이블:
-    - opinion 이 '분석 실패' 인 레코드
-    - score = 0.0  AND  opinion 이 비어있거나 '분석 실패' 인 레코드
+    - score 가 NULL 이거나 opinion 이 '분석 실패'로 시작하는 레코드
+    - opinion 이 비어 있는 레코드
 
 [실행 방법]
-  python delete_sqlite.py              -> 분석 실패 레코드 즉시 삭제
-  python delete_sqlite.py --all-zero  -> score=0.0 전체 즉시 삭제
-  python delete_sqlite.py --dry-run   -> 삭제 없이 미리보기만
+  python delete_sqlite.py          -> 삭제 없이 대상 미리보기
+  python delete_sqlite.py --yes    -> 확인 후 실패 레코드 삭제
+  python delete_sqlite.py --db 경로 -> 다른 DB 대상 미리보기
 """
 
-import sqlite3
 import pathlib
 from datetime import datetime
 
-# ── 설정 ─────────────────────────────────────────────
-DB_PATH = pathlib.Path(__file__).parent / "stock_analysis.db"
+from database import DB_PATH, connect_db, table_exists
 
 
 # ── 실패 레코드 조회 ─────────────────────────────────
-def fetch_failed_records(conn, all_zero=False):
-    if all_zero:
-        query = """
-            SELECT id, timestamp, ticker_name, persona, opinion, score
-            FROM persona_discussion_log
-            WHERE score = 0.0
-            ORDER BY id
-        """
-    else:
-        query = """
-            SELECT id, timestamp, ticker_name, persona, opinion, score
-            FROM persona_discussion_log
-            WHERE opinion LIKE '%분석 실패%'
-               OR (score = 0.0 AND (opinion = '' OR opinion IS NULL OR opinion LIKE '%실패%'))
-            ORDER BY id
-        """
+def fetch_failed_records(conn):
+    query = """
+        SELECT id, timestamp, ticker_name, persona, opinion, score
+        FROM persona_discussion_log
+        WHERE score IS NULL
+           OR opinion LIKE '분석 실패:%'
+           OR opinion = '분석 실패'
+           OR opinion IS NULL
+           OR TRIM(opinion) = ''
+        ORDER BY id
+    """
     return conn.execute(query).fetchall()
 
 
@@ -58,15 +51,21 @@ def delete_failed_records(conn, ids):
 # ── 전체 현황 출력 ────────────────────────────────────
 def print_summary(conn):
     total = conn.execute("SELECT COUNT(*) FROM persona_discussion_log").fetchone()[0]
-    ok    = conn.execute("SELECT COUNT(*) FROM persona_discussion_log WHERE score != 0.0").fetchone()[0]
-    fail  = conn.execute("SELECT COUNT(*) FROM persona_discussion_log WHERE opinion LIKE '%실패%'").fetchone()[0]
+    fail = conn.execute(
+        """
+        SELECT COUNT(*) FROM persona_discussion_log
+        WHERE score IS NULL OR opinion LIKE '분석 실패:%'
+           OR opinion = '분석 실패' OR opinion IS NULL OR TRIM(opinion) = ''
+        """
+    ).fetchone()[0]
+    ok = total - fail
 
     print(f"\n{'='*55}")
     print(f"  [persona_discussion_log 현황]")
     print(f"{'='*55}")
     print(f"  전체 레코드  : {total:>6}행")
-    print(f"  정상 레코드  : {ok:>6}행  (score != 0)")
-    print(f"  실패 레코드  : {fail:>6}행  (opinion LIKE '%실패%')")
+    print(f"  정상 레코드  : {ok:>6}행")
+    print(f"  실패 레코드  : {fail:>6}행  (NULL 또는 명시적 실패)")
     print(f"{'='*55}\n")
 
 
@@ -75,8 +74,14 @@ def print_ticker_summary(conn):
     rows = conn.execute("""
         SELECT ticker_name,
                COUNT(*) as total,
-               SUM(CASE WHEN opinion LIKE '%실패%' THEN 1 ELSE 0 END) as failed,
-               SUM(CASE WHEN score != 0.0 THEN 1 ELSE 0 END) as success
+               SUM(CASE WHEN score IS NULL OR opinion LIKE '분석 실패:%'
+                         OR opinion = '분석 실패' OR opinion IS NULL
+                         OR TRIM(opinion) = '' THEN 1 ELSE 0 END) as failed,
+               SUM(CASE WHEN score IS NOT NULL
+                         AND opinion NOT LIKE '분석 실패:%'
+                         AND opinion != '분석 실패'
+                         AND TRIM(COALESCE(opinion, '')) != ''
+                        THEN 1 ELSE 0 END) as success
         FROM persona_discussion_log
         GROUP BY ticker_name
         ORDER BY ticker_name
@@ -93,11 +98,14 @@ def print_ticker_summary(conn):
 def main():
     import sys
     args = sys.argv[1:]
-    all_zero = "--all-zero" in args
-    dry_run  = "--dry-run"  in args
+    confirmed = "--yes" in args
+
+    if "--all-zero" in args:
+        print("안전상 --all-zero 옵션은 제거되었습니다. 중립 점수 0.0은 삭제하지 않습니다.")
+        return
 
     # --db 옵션 처리
-    db_path = DB_PATH
+    db_path = pathlib.Path(DB_PATH)
     if "--db" in args:
         idx = args.index("--db")
         if idx + 1 < len(args):
@@ -107,39 +115,43 @@ def main():
         print(f"DB 파일을 찾을 수 없습니다: {db_path}")
         return
 
-    conn = sqlite3.connect(str(db_path))
+    conn = connect_db(str(db_path))
     print(f"\nDB: {db_path}")
     print(f"실행 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    if not table_exists(conn, "persona_discussion_log"):
+        print("persona_discussion_log 테이블이 없습니다.")
+        conn.close()
+        return
 
     print_summary(conn)
     print_ticker_summary(conn)
 
-    failed = fetch_failed_records(conn, all_zero=all_zero)
+    failed = fetch_failed_records(conn)
 
     if not failed:
         print("삭제 대상 레코드가 없습니다. DB가 이미 깨끗합니다!")
         conn.close()
         return
 
-    mode = "score=0 전체" if all_zero else "분석 실패"
     print(f"{'─'*55}")
-    print(f"  삭제 대상 ({mode}): {len(failed)}행")
+    print(f"  삭제 대상 (분석 실패): {len(failed)}행")
     print(f"{'─'*55}")
     for row in failed:
         rid, ts, ticker, persona, opinion, score = row
         short_opinion = (opinion or "")[:30].replace("\n", " ")
-        print(f"  id={rid:>4} | {ts} | {ticker:<8} | {persona:<12} | score={score:.2f} | {short_opinion}")
+        score_text = f"{score:.2f}" if score is not None else "NULL"
+        print(f"  id={rid:>4} | {ts} | {ticker:<8} | {persona:<12} | score={score_text} | {short_opinion}")
     print()
 
-    if dry_run:
-        print("[DRY-RUN] 미리보기 모드 - 실제 삭제 안됨.")
-        print("  삭제 실행:         python delete_sqlite.py")
-        print("  score=0 전체 제거: python delete_sqlite.py --all-zero")
-    else:
+    if confirmed:
         ids_to_delete = [row[0] for row in failed]
         deleted = delete_failed_records(conn, ids_to_delete)
         print(f"✅ {deleted}개 레코드 삭제 완료!")
         print_summary(conn)
+    else:
+        print("[미리보기] 실제 데이터는 삭제하지 않았습니다.")
+        print("  위 실패 레코드를 삭제하려면: python delete_sqlite.py --yes")
 
     conn.close()
 

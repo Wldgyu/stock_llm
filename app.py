@@ -1,339 +1,620 @@
 # -*- coding: utf-8 -*-
-"""
-app.py
-───────────────────────────────────────────────────────────────────
-[역할] Stock AI 웹 대시보드 Flask API 서버
-  - stock_analysis.db (SQLite) 를 읽어 REST API 제공
-  - analysis_log 없어도 persona_discussion_log 만으로 동작 가능
-  - 프론트엔드(index.html)에 JSON 데이터 반환
+"""Stock AI 통합 웹 대시보드.
 
-[실행] python app.py
-[접속] http://localhost:5000
+SQLite의 ML/LLM 분석 결과와 yfinance 실시간 시세를 하나의 Flask 서버에서
+제공한다. 실행: ``python app.py`` / 접속: http://localhost:5000
 """
 
+import json
 import os
-import sqlite3
+import threading
+import time
 from datetime import datetime
-from flask import Flask, jsonify, send_from_directory
-from flask_cors import CORS
 
-# ── 설정 ──────────────────────────────────────────────────────────
+import pandas as pd
+import yfinance as yf
+from flask import Flask, Response, jsonify, request, send_from_directory
+
+from database import DB_PATH, connect_db, table_exists
+
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH  = os.environ.get("DB_PATH", os.path.join(BASE_DIR, "stock_analysis.db"))
+PORT = int(os.environ.get("PORT", "5000"))
+POLL_INTERVAL = float(os.environ.get("PRICE_POLL_INTERVAL", "15"))
 
-app = Flask(__name__, static_folder=BASE_DIR, static_url_path="")
-CORS(app)
+WATCHLIST = {
+    "삼성전자": {"symbol": "005930.KS", "currency": "KRW", "exchange": "KRX"},
+    "엔비디아": {"symbol": "NVDA", "currency": "USD", "exchange": "NASDAQ"},
+    "인텔": {"symbol": "INTC", "currency": "USD", "exchange": "NASDAQ"},
+    "애플": {"symbol": "AAPL", "currency": "USD", "exchange": "NASDAQ"},
+    "테슬라": {"symbol": "TSLA", "currency": "USD", "exchange": "NASDAQ"},
+    "마이크로소프트": {"symbol": "MSFT", "currency": "USD", "exchange": "NASDAQ"},
+}
+SYMBOL_TO_NAME = {meta["symbol"]: name for name, meta in WATCHLIST.items()}
+
+# Flask의 자동 정적 라우트를 끄고 공개할 파일만 아래에서 명시합니다.
+app = Flask(__name__, static_folder=None)
+
+_price_cache = {}
+_candle_cache = {}
+_cache_lock = threading.Lock()
+_poll_thread = None
 
 
-# ── DB 헬퍼 ──────────────────────────────────────────────────────
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+# ---------------------------------------------------------------------------
+# 공통 변환 및 실시간 데이터
+# ---------------------------------------------------------------------------
+def _to_float(value):
+    if value is None:
+        return None
+    try:
+        number = float(value)
+        return number if pd.notna(number) else None
+    except (TypeError, ValueError):
+        return None
 
 
-def table_exists(conn, name: str) -> bool:
-    cur = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)
+def _quote_for(name, meta):
+    """1분봉을 우선 사용해 정규장·장전·장후 최신 가격을 조회한다."""
+    symbol = meta["symbol"]
+    ticker = yf.Ticker(symbol)
+    fast_info = ticker.fast_info
+    previous = _to_float(getattr(fast_info, "previous_close", None))
+    average_volume = _to_float(
+        getattr(fast_info, "three_month_average_volume", None)
     )
-    return cur.fetchone() is not None
+    price = None
+    volume = None
+    price_timestamp = datetime.now()
+
+    try:
+        # fast_info.last_price는 장전·장후에 종가로 고정될 수 있어 1분봉을 우선합니다.
+        intraday = ticker.history(
+            period="1d",
+            interval="1m",
+            prepost=True,
+            auto_adjust=True,
+        )
+        if not intraday.empty:
+            price = _to_float(intraday["Close"].dropna().iloc[-1])
+            volume = _to_float(intraday["Volume"].fillna(0).sum())
+            price_timestamp = intraday.index[-1]
+    except Exception as exc:
+        print(f"[실시간 시세] {symbol} 1분봉 조회 실패: {exc}")
+
+    if price is None:
+        price = _to_float(getattr(fast_info, "last_price", None))
+        volume = average_volume
+
+    if price is None:
+        history = ticker.history(period="2d", interval="1d", auto_adjust=True)
+        if not history.empty:
+            price = _to_float(history["Close"].iloc[-1])
+            previous = _to_float(history["Close"].iloc[-2]) if len(history) > 1 else price
+
+    if price is None:
+        return None
+
+    previous = previous or price
+    change = price - previous
+    percent = (change / previous * 100) if previous else 0.0
+    return {
+        "name": name,
+        "symbol": symbol,
+        "price": round(price, 4),
+        "change": round(change, 4),
+        "pct": round(percent, 4),
+        "volume": int(volume) if volume else 0,
+        "ts": price_timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+        "currency": meta["currency"],
+        "exchange": meta["exchange"],
+    }
 
 
-# ── 정적 파일 ─────────────────────────────────────────────────────
+def _poll_prices():
+    while True:
+        for name, meta in WATCHLIST.items():
+            try:
+                quote = _quote_for(name, meta)
+                if quote:
+                    with _cache_lock:
+                        _price_cache[meta["symbol"]] = quote
+            except Exception as exc:
+                print(f"[실시간 시세] {meta['symbol']} 조회 실패: {exc}")
+        time.sleep(POLL_INTERVAL)
+
+
+def start_price_poller():
+    """개발 재로더에서도 폴링 스레드가 중복 생성되지 않도록 보호한다."""
+    global _poll_thread
+    if _poll_thread and _poll_thread.is_alive():
+        return
+    _poll_thread = threading.Thread(target=_poll_prices, name="stock-price-poller", daemon=True)
+    _poll_thread.start()
+
+
+@app.before_request
+def ensure_price_poller():
+    """python app.py와 flask run 모두에서 시세 수집기를 한 번 시작합니다."""
+    start_price_poller()
+
+
+def _calculate_indicators(frame):
+    frame = frame.copy()
+    close = frame["Close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+
+    frame["MA5"] = close.rolling(5).mean()
+    frame["MA20"] = close.rolling(20).mean()
+    frame["MA60"] = close.rolling(60).mean()
+    rolling_std = close.rolling(20).std()
+    frame["BB_UP"] = frame["MA20"] + (2 * rolling_std)
+    frame["BB_LOW"] = frame["MA20"] - (2 * rolling_std)
+
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    relative_strength = gain / (loss + 1e-9)
+    frame["RSI"] = 100 - (100 / (1 + relative_strength))
+    return frame
+
+
+def _frame_to_candles(frame):
+    candles = []
+    for timestamp, row in frame.iterrows():
+        if isinstance(timestamp, pd.Timestamp):
+            has_time = bool(timestamp.hour or timestamp.minute)
+            label = timestamp.strftime("%Y-%m-%d %H:%M" if has_time else "%Y-%m-%d")
+        else:
+            label = str(timestamp)
+
+        candles.append(
+            {
+                "t": label,
+                "o": _to_float(row.get("Open")),
+                "h": _to_float(row.get("High")),
+                "l": _to_float(row.get("Low")),
+                "c": _to_float(row.get("Close")),
+                "v": _to_float(row.get("Volume")),
+                "ma5": _to_float(row.get("MA5")),
+                "ma20": _to_float(row.get("MA20")),
+                "ma60": _to_float(row.get("MA60")),
+                "bb_up": _to_float(row.get("BB_UP")),
+                "bb_low": _to_float(row.get("BB_LOW")),
+                "rsi": _to_float(row.get("RSI")),
+            }
+        )
+    return candles
+
+
+INTERVAL_MAP = {
+    "1m": ("1d", "1m"),
+    "5m": ("5d", "5m"),
+    "15m": ("5d", "15m"),
+    "1h": ("1mo", "1h"),
+    "1d": ("1y", "1d"),
+    "1wk": ("5y", "1wk"),
+}
+
+
+# ---------------------------------------------------------------------------
+# SQLite 조회
+# ---------------------------------------------------------------------------
+def get_connection():
+    return connect_db(row_factory=True)
+
+
+def _latest_analysis_map(connection):
+    if not table_exists(connection, "analysis_log"):
+        return {}
+    rows = connection.execute(
+        """
+        SELECT a.*
+        FROM analysis_log a
+        INNER JOIN (
+            SELECT name, MAX(id) AS latest_id
+            FROM analysis_log
+            GROUP BY name
+        ) latest ON latest.latest_id = a.id
+        """
+    ).fetchall()
+    return {row["name"]: dict(row) for row in rows}
+
+
+def _latest_persona_map(connection):
+    if not table_exists(connection, "persona_discussion_log"):
+        return {}
+    rows = connection.execute(
+        """
+        SELECT p.ticker_name, p.score, p.opinion, p.timestamp
+        FROM persona_discussion_log p
+        INNER JOIN (
+            SELECT ticker_name, MAX(id) AS latest_id
+            FROM persona_discussion_log
+            WHERE persona='최종결정자'
+            GROUP BY ticker_name
+        ) latest ON latest.latest_id = p.id
+        """
+    ).fetchall()
+    return {
+        row["ticker_name"]: {
+            "score": row["score"],
+            "opinion": row["opinion"] or "",
+            "timestamp": row["timestamp"],
+        }
+        for row in rows
+    }
+
+
+def _trend(value, mode="rsi"):
+    if value is None:
+        return "⚪", "분석 없음"
+    value = float(value or 0)
+    if mode == "rsi":
+        if value > 70:
+            return "🔴", "과매수"
+        if value < 30:
+            return "🟢", "과매도(반등)"
+    else:
+        if value > 0.1:
+            return "🟢", "매수 우세"
+        if value < -0.1:
+            return "🔴", "매도 우세"
+    return "⚖️", "중립"
+
+
+def _stock_payload(name, analysis=None, persona=None):
+    analysis = analysis or {}
+    persona = persona or {}
+    watch = WATCHLIST.get(name, {})
+    symbol = analysis.get("symbol") or watch.get("symbol", "")
+
+    with _cache_lock:
+        quote = dict(_price_cache.get(symbol, {}))
+
+    rsi = _to_float(analysis.get("rsi"))
+    if rsi is not None:
+        trend_emoji, trend_label = _trend(rsi, "rsi")
+    elif persona and persona.get("score") is None:
+        trend_emoji, trend_label = "❌", "AI 분석 실패"
+    else:
+        trend_emoji, trend_label = _trend(persona.get("score"), "score")
+    source_parts = []
+    if analysis:
+        source_parts.append("ml")
+    if persona:
+        source_parts.append("llm")
+    if watch:
+        source_parts.append("live")
+
+    return {
+        "name": name,
+        "symbol": symbol,
+        "currency": quote.get("currency") or watch.get("currency") or (
+            "KRW" if symbol.endswith(".KS") else "USD"
+        ),
+        "exchange": quote.get("exchange") or watch.get("exchange", ""),
+        "price": quote.get("price"),
+        "change": quote.get("change"),
+        "pct": quote.get("pct"),
+        "volume": quote.get("volume"),
+        "live_timestamp": quote.get("ts", ""),
+        "timestamp": analysis.get("timestamp") or persona.get("timestamp", ""),
+        "last_close": analysis.get("last_close"),
+        "rsi": rsi,
+        "trend_emoji": trend_emoji,
+        "trend_label": trend_label,
+        "support": analysis.get("support"),
+        "resistance": analysis.get("resistance"),
+        "usd_krw": analysis.get("usd_krw"),
+        "sox": analysis.get("sox"),
+        "sentiment": analysis.get("sentiment"),
+        "pred_low": analysis.get("pred_low"),
+        "pred_high": analysis.get("pred_high"),
+        "risk_score": analysis.get("risk_score"),
+        "final_score": persona.get("score"),
+        "final_opinion": persona.get("opinion", "")[:200],
+        "source": "+".join(source_parts) or "none",
+    }
+
+
+# ---------------------------------------------------------------------------
+# 정적 페이지 및 통합 API
+# ---------------------------------------------------------------------------
 @app.route("/")
 def index():
     return send_from_directory(BASE_DIR, "index.html")
 
 
-# ── API: DB 상태 ──────────────────────────────────────────────────
+@app.route("/app.js")
+def frontend_script():
+    return send_from_directory(BASE_DIR, "app.js")
+
+
+@app.route("/style.css")
+def frontend_style():
+    return send_from_directory(BASE_DIR, "style.css")
+
+
 @app.route("/api/status")
 def api_status():
-    conn = get_conn()
+    connection = get_connection()
     try:
-        has_analysis = table_exists(conn, "analysis_log")
-        has_persona  = table_exists(conn, "persona_discussion_log")
-        analysis_count = conn.execute("SELECT COUNT(*) FROM analysis_log").fetchone()[0] if has_analysis else 0
-        persona_count  = conn.execute("SELECT COUNT(*) FROM persona_discussion_log").fetchone()[0] if has_persona else 0
-        return jsonify({
-            "db_path":        DB_PATH,
-            "has_analysis":   has_analysis,
-            "has_persona":    has_persona,
-            "analysis_count": analysis_count,
-            "persona_count":  persona_count,
-            "server_time":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        })
+        has_analysis = table_exists(connection, "analysis_log")
+        has_persona = table_exists(connection, "persona_discussion_log")
+        analysis_count = (
+            connection.execute("SELECT COUNT(*) FROM analysis_log").fetchone()[0]
+            if has_analysis
+            else 0
+        )
+        persona_count = (
+            connection.execute("SELECT COUNT(*) FROM persona_discussion_log").fetchone()[0]
+            if has_persona
+            else 0
+        )
+        with _cache_lock:
+            live_count = len(_price_cache)
+        return jsonify(
+            {
+                "has_analysis": has_analysis,
+                "has_persona": has_persona,
+                "analysis_count": analysis_count,
+                "persona_count": persona_count,
+                "live_count": live_count,
+                "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        )
     finally:
-        conn.close()
+        connection.close()
 
 
-# ── 공통 헬퍼: persona 최종결정자 점수 맵 ─────────────────────────
-def _get_persona_scores(conn):
-    """ticker_name → {score, opinion, timestamp} 딕셔너리 반환"""
-    scores = {}
-    if not table_exists(conn, "persona_discussion_log"):
-        return scores
-    rows = conn.execute("""
-        SELECT p.ticker_name, p.score, p.opinion, p.timestamp
-        FROM persona_discussion_log p
-        INNER JOIN (
-            SELECT ticker_name, MAX(id) AS max_id
-            FROM persona_discussion_log
-            WHERE persona = '최종결정자'
-            GROUP BY ticker_name
-        ) m ON p.ticker_name = m.ticker_name AND p.id = m.max_id
-    """).fetchall()
-    for r in rows:
-        scores[r["ticker_name"]] = {
-            "score":     r["score"],
-            "opinion":   (r["opinion"] or "")[:200],
-            "timestamp": r["timestamp"],
-        }
-    return scores
-
-
-def _trend(rsi_or_score, is_rsi=True):
-    """RSI 또는 AI 점수 → (emoji, label) 반환"""
-    v = float(rsi_or_score or 0)
-    if is_rsi:
-        if v > 70:   return "🔴", "과매수"
-        if v < 30:   return "🟢", "과매도(반등)"
-        return "⚖️", "중립"
-    else:
-        if v > 0.1:  return "🟢", "매수 우세"
-        if v < -0.1: return "🔴", "매도 우세"
-        return "⚖️", "중립"
-
-
-# ── API: 전체 종목 목록 ──────────────────────────────────────────
 @app.route("/api/stocks")
 def api_stocks():
-    """
-    종목 목록 반환.
-    - analysis_log 있음 → ML 지표 + AI 점수
-    - analysis_log 없음 → persona_discussion_log 로 종목 구성
-    """
-    conn = get_conn()
+    connection = get_connection()
     try:
-        persona_scores = _get_persona_scores(conn)
-        result = []
-
-        # ── Case 1: analysis_log 있음 ───────────────────────────
-        if table_exists(conn, "analysis_log"):
-            rows = conn.execute("""
-                SELECT a.* FROM analysis_log a
-                INNER JOIN (
-                    SELECT name, MAX(timestamp) AS max_ts
-                    FROM analysis_log GROUP BY name
-                ) b ON a.name = b.name AND a.timestamp = b.max_ts
-                ORDER BY a.name
-            """).fetchall()
-
-            for row in rows:
-                d   = dict(row)
-                nm  = d.get("name", "")
-                rsi = float(d.get("rsi") or 50)
-                te, tl = _trend(rsi, is_rsi=True)
-                ps     = persona_scores.get(nm, {})
-                result.append({
-                    "name":          nm,
-                    "symbol":        d.get("symbol", ""),
-                    "timestamp":     d.get("timestamp", ""),
-                    "last_close":    d.get("last_close"),
-                    "rsi":           round(rsi, 2),
-                    "trend_emoji":   te,
-                    "trend_label":   tl,
-                    "support":       d.get("support"),
-                    "resistance":    d.get("resistance"),
-                    "usd_krw":       d.get("usd_krw"),
-                    "sox":           d.get("sox"),
-                    "sentiment":     d.get("sentiment"),
-                    "pred_low":      d.get("pred_low"),
-                    "pred_high":     d.get("pred_high"),
-                    "risk_score":    d.get("risk_score"),
-                    "final_score":   ps.get("score"),
-                    "final_opinion": ps.get("opinion", ""),
-                    "source":        "ml+llm",
-                })
-
-        # ── Case 2: persona_log 만 있음 ─────────────────────────
-        else:
-            if not persona_scores:
-                return jsonify({"stocks": [], "message": "DB에 데이터가 없습니다. ml_stock.py 또는 llm_stock.py를 먼저 실행하세요."})
-
-            for nm, ps in persona_scores.items():
-                score = ps.get("score")
-                te, tl = _trend(score, is_rsi=False)
-                result.append({
-                    "name":          nm,
-                    "symbol":        "",
-                    "timestamp":     ps.get("timestamp", ""),
-                    "last_close":    None,
-                    "rsi":           None,
-                    "trend_emoji":   te,
-                    "trend_label":   tl,
-                    "support":       None,
-                    "resistance":    None,
-                    "usd_krw":       None,
-                    "sox":           None,
-                    "sentiment":     None,
-                    "pred_low":      None,
-                    "pred_high":     None,
-                    "risk_score":    None,
-                    "final_score":   score,
-                    "final_opinion": ps.get("opinion", ""),
-                    "source":        "llm_only",
-                })
-
-        return jsonify({"stocks": result})
+        analyses = _latest_analysis_map(connection)
+        personas = _latest_persona_map(connection)
+        names = list(WATCHLIST)
+        names.extend(sorted((set(analyses) | set(personas)) - set(names)))
+        stocks = [
+            _stock_payload(name, analyses.get(name), personas.get(name))
+            for name in names
+        ]
+        return jsonify({"stocks": stocks})
     finally:
-        conn.close()
+        connection.close()
 
 
-# ── API: 종목 상세 ────────────────────────────────────────────────
 @app.route("/api/stock/<string:name>")
-def api_stock_detail(name: str):
-    """
-    특정 종목 상세 반환.
-    - analysis_log 있음 → 차트/예측/지표 포함
-    - analysis_log 없음 → persona 기반 최소 정보 반환 (404 아님)
-    """
-    conn = get_conn()
+def api_stock_detail(name):
+    connection = get_connection()
     try:
-        # ── Case 1: analysis_log 있음 ───────────────────────────
-        if table_exists(conn, "analysis_log"):
-            rows = conn.execute("""
-                SELECT * FROM analysis_log
-                WHERE name = ?
-                ORDER BY timestamp DESC
-                LIMIT 30
-            """, (name,)).fetchall()
+        analyses = _latest_analysis_map(connection)
+        personas = _latest_persona_map(connection)
+        analysis = analyses.get(name)
+        persona = personas.get(name)
+        if name not in WATCHLIST and not analysis and not persona:
+            return jsonify({"error": f"종목 '{name}' 데이터가 없습니다."}), 404
 
-            if rows:
-                latest  = dict(rows[0])
-                history = [dict(r) for r in rows]
-                asc     = list(reversed(history))
+        history = []
+        if analysis:
+            history = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM analysis_log WHERE name=? ORDER BY id DESC LIMIT 30",
+                    (name,),
+                ).fetchall()
+            ]
 
-                rsi = float(latest.get("rsi") or 50)
-                te, tl = _trend(rsi, is_rsi=True)
-
-                return jsonify({
-                    "name":          name,
-                    "symbol":        latest.get("symbol", ""),
-                    "latest":        latest,
-                    "rsi":           round(rsi, 2),
-                    "trend_emoji":   te,
-                    "trend_label":   tl,
-                    "chart": {
-                        "labels":    [r.get("timestamp", "")[:16] for r in asc],
-                        "prices":    [r.get("last_close") for r in asc],
-                        "pred_low":  [r.get("pred_low") for r in asc],
-                        "pred_high": [r.get("pred_high") for r in asc],
-                    },
-                    "history_count": len(history),
-                    "source":        "ml+llm",
-                })
-
-        # ── Case 2: persona_log 만 있음 ─────────────────────────
-        if not table_exists(conn, "persona_discussion_log"):
-            return jsonify({"error": "DB에 데이터가 없습니다. ml_stock.py 또는 llm_stock.py를 먼저 실행하세요."}), 404
-
-        cnt = conn.execute(
-            "SELECT COUNT(*) FROM persona_discussion_log WHERE ticker_name=?", (name,)
-        ).fetchone()[0]
-        if cnt == 0:
-            return jsonify({"error": f"종목 '{name}' 데이터 없음"}), 404
-
-        # 최종결정자 점수 → 트렌드
-        final = conn.execute("""
-            SELECT score, timestamp FROM persona_discussion_log
-            WHERE ticker_name=? AND persona='최종결정자'
-            ORDER BY id DESC LIMIT 1
-        """, (name,)).fetchone()
-
-        score = float(final["score"]) if final else 0
-        ts    = final["timestamp"]    if final else ""
-        te, tl = _trend(score, is_rsi=False)
-
-        empty_latest = {
-            "name": name, "symbol": "", "timestamp": ts,
-            "last_close": None, "rsi": None, "trend": None,
-            "support": None, "resistance": None,
-            "usd_krw": None, "sox": None,
-            "sentiment": None, "pred_low": None, "pred_high": None,
-            "risk_score": None,
-        }
-
-        return jsonify({
-            "name":          name,
-            "symbol":        "",
-            "latest":        empty_latest,
-            "rsi":           None,
-            "trend_emoji":   te,
-            "trend_label":   tl,
-            "chart":         {"labels": [], "prices": [], "pred_low": [], "pred_high": []},
-            "history_count": 0,
-            "source":        "llm_only",
-            "message":       "ml_stock.py 실행 후 차트와 기술지표를 볼 수 있습니다.",
-        })
-
+        stock = _stock_payload(name, analysis, persona)
+        stock.update(
+            {
+                "latest": analysis or {
+                    "name": name,
+                    "symbol": stock["symbol"],
+                    "last_close": None,
+                    "rsi": None,
+                    "support": None,
+                    "resistance": None,
+                    "usd_krw": None,
+                    "sox": None,
+                    "sentiment": None,
+                    "pred_low": None,
+                    "pred_high": None,
+                    "risk_score": None,
+                },
+                "history_count": len(history),
+                "analysis_chart": {
+                    "labels": [row.get("timestamp", "")[:16] for row in reversed(history)],
+                    "prices": [row.get("last_close") for row in reversed(history)],
+                    "pred_low": [row.get("pred_low") for row in reversed(history)],
+                    "pred_high": [row.get("pred_high") for row in reversed(history)],
+                },
+                "message": None if analysis else "이 종목은 실시간 데이터만 제공됩니다.",
+            }
+        )
+        return jsonify(stock)
     finally:
-        conn.close()
+        connection.close()
 
 
-# ── API: AI 페르소나 분석 ─────────────────────────────────────────
 @app.route("/api/stock/<string:name>/ai")
-def api_stock_ai(name: str):
-    """특정 종목의 LLM 페르소나 토론 결과 반환 (최신 1세트)"""
-    conn = get_conn()
+def api_stock_ai(name):
+    connection = get_connection()
     try:
-        if not table_exists(conn, "persona_discussion_log"):
-            return jsonify({"error": "persona_discussion_log 없음. llm_stock.py를 먼저 실행하세요."}), 404
+        if not table_exists(connection, "persona_discussion_log"):
+            return jsonify({"error": "AI 분석 결과가 없습니다. llm_stock.py를 먼저 실행하세요."}), 404
 
-        cnt = conn.execute(
-            "SELECT COUNT(*) FROM persona_discussion_log WHERE ticker_name=?", (name,)
-        ).fetchone()[0]
-        if cnt == 0:
-            return jsonify({"error": f"'{name}' AI 분석 결과 없음. llm_stock.py를 먼저 실행하세요."}), 404
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(persona_discussion_log)"
+            ).fetchall()
+        }
+        latest_run = None
+        if "run_id" in columns:
+            latest_run = connection.execute(
+                """
+                SELECT run_id
+                FROM persona_discussion_log
+                WHERE ticker_name=? AND persona='최종결정자'
+                  AND run_id IS NOT NULL
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (name,),
+            ).fetchone()
 
-        personas = conn.execute("""
-            SELECT * FROM persona_discussion_log
-            WHERE ticker_name=?
-            ORDER BY id DESC
-            LIMIT 3
-        """, (name,)).fetchall()
+        if latest_run:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM persona_discussion_log
+                WHERE ticker_name=? AND run_id=?
+                ORDER BY id
+                """,
+                (name, latest_run["run_id"]),
+            ).fetchall()
+        else:
+            # run_id가 없는 기존 데이터는 페르소나별 최신 행을 사용합니다.
+            rows = connection.execute(
+                """
+                SELECT p.*
+                FROM persona_discussion_log p
+                INNER JOIN (
+                    SELECT persona, MAX(id) AS latest_id
+                    FROM persona_discussion_log
+                    WHERE ticker_name=?
+                    GROUP BY persona
+                ) latest ON latest.latest_id=p.id
+                ORDER BY p.id
+                """,
+                (name,),
+            ).fetchall()
+        if not rows:
+            return jsonify({"error": f"'{name}' AI 분석 결과가 없습니다."}), 404
 
-        result = []
-        for p in personas:
-            d     = dict(p)
-            score = float(d.get("score") or 0)
-            if score > 0.1:
-                signal, signal_color = "매수", "#00e5a0"
+        personas = []
+        for row in rows:
+            data = dict(row)
+            raw_score = data.get("score")
+            score = float(raw_score) if raw_score is not None else None
+            if score is None:
+                signal = "분석 실패"
+            elif score > 0.1:
+                signal = "매수"
             elif score < -0.1:
-                signal, signal_color = "매도", "#ff4d6d"
+                signal = "매도"
             else:
-                signal, signal_color = "중립", "#f5c518"
+                signal = "중립"
+            personas.append(
+                {
+                    "persona": data.get("persona", ""),
+                    "score": round(score, 3) if score is not None else None,
+                    "signal": signal,
+                    "opinion": data.get("opinion", ""),
+                    "timestamp": data.get("timestamp", ""),
+                }
+            )
 
-            result.append({
-                "persona":      d.get("persona", ""),
-                "score":        round(score, 3),
-                "signal":       signal,
-                "signal_color": signal_color,
-                "opinion":      d.get("opinion", ""),
-                "timestamp":    d.get("timestamp", ""),
-            })
-
-        final = next((p for p in result if p["persona"] == "최종결정자"), None)
-        return jsonify({"name": name, "personas": result, "final": final})
-
+        final = next((item for item in personas if item["persona"] == "최종결정자"), None)
+        return jsonify({"name": name, "personas": personas, "final": final})
     finally:
-        conn.close()
+        connection.close()
 
 
-# ── 실행 ──────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# 실시간 API (동일 포트)
+# ---------------------------------------------------------------------------
+@app.route("/api/live/watchlist")
+def api_live_watchlist():
+    connection = get_connection()
+    try:
+        analyses = _latest_analysis_map(connection)
+        personas = _latest_persona_map(connection)
+        return jsonify(
+            {
+                "stocks": [
+                    _stock_payload(name, analyses.get(name), personas.get(name))
+                    for name in WATCHLIST
+                ],
+                "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        )
+    finally:
+        connection.close()
+
+
+@app.route("/api/live/candles/<string:symbol>")
+def api_live_candles(symbol):
+    symbol = symbol.upper()
+    if symbol not in SYMBOL_TO_NAME:
+        return jsonify({"error": f"지원하지 않는 종목입니다: {symbol}"}), 404
+
+    interval = request.args.get("interval", "1d")
+    if interval not in INTERVAL_MAP:
+        return jsonify({"error": f"지원하지 않는 구간입니다: {interval}"}), 400
+
+    cache_key = (symbol, interval)
+    with _cache_lock:
+        cached = _candle_cache.get(cache_key)
+        quote = dict(_price_cache.get(symbol, {}))
+    if cached and time.time() - cached["saved_at"] < 20:
+        return jsonify({**cached["payload"], "meta": quote, "cached": True})
+
+    period, yf_interval = INTERVAL_MAP[interval]
+    try:
+        frame = yf.Ticker(symbol).history(
+            period=period, interval=yf_interval, auto_adjust=True
+        )
+        if frame.empty:
+            return jsonify({"symbol": symbol, "interval": interval, "candles": [], "meta": quote})
+
+        candles = _frame_to_candles(_calculate_indicators(frame))
+        payload = {
+            "symbol": symbol,
+            "interval": interval,
+            "candles": candles,
+            "meta": quote,
+            "count": len(candles),
+        }
+        with _cache_lock:
+            _candle_cache[cache_key] = {"saved_at": time.time(), "payload": payload}
+        return jsonify(payload)
+    except Exception as exc:
+        app.logger.exception("캔들 데이터 조회 실패")
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.route("/api/live/stream")
+def api_live_stream():
+    def generate():
+        yield "retry: 6000\n\n"
+        while True:
+            with _cache_lock:
+                snapshot = list(_price_cache.values())
+            yield f"data: {json.dumps(snapshot, ensure_ascii=False)}\n\n"
+            time.sleep(5)
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 if __name__ == "__main__":
+    start_price_poller()
     print("=" * 60)
-    print("  📈 Stock AI Dashboard — Flask API 서버")
+    print("  Stock AI 통합 대시보드")
     print(f"  DB  : {DB_PATH}")
-    print("  URL : http://localhost:5000")
+    print(f"  URL : http://localhost:{PORT}")
     print("=" * 60)
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(
+        host="0.0.0.0",
+        port=PORT,
+        debug=os.environ.get("FLASK_DEBUG") == "1",
+        threaded=True,
+        use_reloader=False,
+    )

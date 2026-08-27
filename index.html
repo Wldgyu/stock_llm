@@ -3,154 +3,122 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="Stock AI Portfolio — LSTM 딥러닝 + LLM 페르소나 토론 기반 주식 AI 분석 대시보드">
+  <meta name="description" content="실시간 주가와 ML·LLM 분석을 결합한 주식 대시보드">
   <title>Stock AI Dashboard</title>
-
-  <!-- Chart.js -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
-  <!-- Stylesheet -->
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-
-<div class="app-wrapper">
-
-  <!-- ════════════════════════════════════════════
-       NAVBAR
-  ════════════════════════════════════════════ -->
-  <nav class="navbar">
-    <a class="navbar-brand" href="#" onclick="goBack(); return false;">
-      <div class="navbar-logo">📈</div>
-      <div>
-        <div class="navbar-title">Stock AI Dashboard</div>
-        <div class="navbar-subtitle">LSTM + LLM 페르소나 분석</div>
+  <div class="app-wrapper">
+    <nav class="navbar">
+      <button class="navbar-brand" id="home-button" type="button">
+        <span class="navbar-logo">📈</span>
+        <span>
+          <span class="navbar-title">Stock AI Dashboard</span>
+          <span class="navbar-subtitle">실시간 시세 + LSTM + LLM 분석</span>
+        </span>
+      </button>
+      <div class="navbar-status">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="status-text">서버 연결 확인 중...</span>
+        <span class="server-time" id="server-time">--:--:--</span>
       </div>
-    </a>
+    </nav>
 
-    <div class="navbar-status">
-      <div class="status-dot" id="status-dot"></div>
-      <span id="status-text">연결 확인 중...</span>
-    </div>
-  </nav>
+    <main class="page main-page active" id="main-page">
+      <header class="section-header">
+        <h1 class="section-title">
+          종목 현황
+          <span class="section-badge">6개 관심 종목</span>
+        </h1>
+        <span class="timestamp-label" id="last-update"></span>
+      </header>
+      <div class="stocks-grid" id="stocks-grid" aria-live="polite"></div>
+    </main>
 
-  <!-- ════════════════════════════════════════════
-       PAGE 1 — Main (Stock List)
-  ════════════════════════════════════════════ -->
-  <div class="page main-page active" id="main-page">
-
-    <div class="section-header">
-      <h1 class="section-title">
-        📊 종목 현황
-        <span class="section-badge">AI 분석 포트폴리오</span>
-      </h1>
-      <span class="timestamp-label" id="last-update"></span>
-    </div>
-
-    <div class="stocks-grid" id="stocks-grid">
-      <!-- 카드들이 JS로 렌더링됩니다 -->
-    </div>
-
-  </div><!-- /main-page -->
-
-
-  <!-- ════════════════════════════════════════════
-       PAGE 2 — Detail (Stock Chart + AI)
-  ════════════════════════════════════════════ -->
-  <div class="page detail-page" id="detail-page">
-
-    <!-- ── Main content area ──────────────────── -->
-    <div class="detail-main" id="detail-main">
-
-      <!-- Back + AI button row -->
-      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
-        <button class="back-btn" onclick="goBack()" id="back-btn">
-          ← 목록으로
-        </button>
-        <button class="ai-btn" onclick="toggleAiPanel()" id="ai-btn">
-          <span class="ai-btn-icon">🤖</span>
-          AI 분석 보기
-          <span class="ai-btn-pulse" id="ai-btn-pulse"></span>
-        </button>
-      </div>
-
-      <!-- Stock header -->
-      <div class="detail-header">
-        <div class="detail-title-group">
-          <h2 class="detail-name" id="detail-name">—</h2>
-          <div class="detail-symbol" id="detail-symbol">—</div>
-          <div class="card-trend-badge" id="detail-trend-badge" style="margin-top:8px;width:fit-content">—</div>
+    <main class="page detail-page" id="detail-page">
+      <div class="detail-main">
+        <div class="detail-actions">
+          <button class="back-btn" id="back-button" type="button">← 목록으로</button>
+          <button class="ai-btn" id="ai-button" type="button">
+            <span class="ai-btn-icon">🤖</span>
+            AI 분석 보기
+            <span class="ai-btn-pulse"></span>
+          </button>
         </div>
-        <div class="detail-price-group">
-          <div class="detail-price" id="detail-price">—</div>
-          <div class="detail-timestamp" id="detail-timestamp"></div>
-        </div>
-      </div>
 
-      <!-- KPI row -->
-      <div class="kpi-row" id="kpi-row">
-        <!-- JS로 렌더링 -->
-      </div>
-
-      <!-- Chart -->
-      <div class="chart-section">
-        <div class="chart-section-header">
-          <div class="chart-title">
-            📈 가격 히스토리
+        <header class="detail-header">
+          <div class="detail-title-group">
+            <h2 class="detail-name" id="detail-name">—</h2>
+            <span class="detail-symbol" id="detail-symbol">—</span>
+            <span class="card-trend-badge detail-trend" id="detail-trend">—</span>
           </div>
-          <div class="chart-legend">
-            <div class="legend-item">
-              <div class="legend-dot" style="background:#6e56ff"></div>
-              실제가
+          <div class="detail-price-group">
+            <span class="price-label">실시간 현재가</span>
+            <div class="detail-price" id="detail-price">—</div>
+            <div class="detail-change" id="detail-change">—</div>
+            <div class="detail-timestamp" id="detail-timestamp">시세 대기 중</div>
+            <div class="analysis-close" id="analysis-close"></div>
+          </div>
+        </header>
+
+        <section id="analysis-section" aria-labelledby="analysis-kpi-title">
+          <div class="subsection-header">
+            <h3 id="analysis-kpi-title">배치 분석 지표</h3>
+            <span id="analysis-message"></span>
+          </div>
+          <div class="kpi-row" id="analysis-kpis"></div>
+        </section>
+
+        <section class="chart-section" aria-labelledby="live-chart-title">
+          <div class="chart-section-header">
+            <div>
+              <h3 class="chart-title" id="live-chart-title">실시간 가격 차트</h3>
+              <div class="interval-bar" id="interval-bar">
+                <button class="interval-btn" type="button" data-interval="1m">1분</button>
+                <button class="interval-btn" type="button" data-interval="5m">5분</button>
+                <button class="interval-btn" type="button" data-interval="15m">15분</button>
+                <button class="interval-btn" type="button" data-interval="1h">1시간</button>
+                <button class="interval-btn active" type="button" data-interval="1d">1일</button>
+                <button class="interval-btn" type="button" data-interval="1wk">1주</button>
+              </div>
             </div>
-            <div class="legend-item">
-              <div class="legend-dot" style="background:#00e5a0"></div>
-              예측 하단
+            <span class="live-badge"><span class="live-dot"></span> LIVE</span>
+          </div>
+
+          <div class="live-kpi-strip" id="live-kpis"></div>
+
+          <div class="live-chart-grid">
+            <div class="live-price-panel">
+              <span class="panel-label">PRICE · MA · BOLLINGER</span>
+              <div class="chart-loading" id="chart-loading"><span class="spinner"></span></div>
+              <canvas id="live-price-chart"></canvas>
             </div>
-            <div class="legend-item">
-              <div class="legend-dot" style="background:#ff4d6d"></div>
-              예측 상단
+            <div class="live-rsi-panel">
+              <span class="panel-label">RSI (14)</span>
+              <canvas id="live-rsi-chart"></canvas>
             </div>
           </div>
-        </div>
-        <div class="chart-container">
-          <canvas id="price-chart"></canvas>
-        </div>
+        </section>
+
+        <section class="prediction-section" id="prediction-section" aria-labelledby="prediction-title">
+          <h3 class="prediction-title" id="prediction-title">LSTM 가격 예측 범위</h3>
+          <div class="prediction-cards" id="prediction-cards"></div>
+        </section>
       </div>
+    </main>
 
-      <!-- Prediction cards -->
-      <div class="prediction-section">
-        <div class="prediction-title">🔮 LSTM 가격 예측</div>
-        <div class="prediction-cards" id="prediction-cards">
-          <!-- JS로 렌더링 -->
+    <aside class="ai-panel" id="ai-panel" aria-hidden="true">
+      <div class="ai-panel-inner">
+        <div class="ai-panel-header">
+          <div class="ai-panel-title">🤖 AI 페르소나 분석 — <span id="ai-stock-name"></span></div>
+          <button class="ai-panel-close" id="ai-close-button" type="button" aria-label="닫기">✕</button>
         </div>
+        <div id="ai-panel-content"></div>
       </div>
+    </aside>
+  </div>
 
-    </div><!-- /detail-main -->
-
-  </div><!-- /detail-page -->
-
-  <!-- ════════════════════════════════════════════
-       AI BOTTOM DRAWER (고정 화면 하단)
-  ═══════════════════════════════════════════ -->
-  <div class="ai-panel" id="ai-panel">
-    <div class="ai-panel-inner">
-      <div class="ai-panel-header">
-        <div class="ai-panel-title">
-          🤖 AI 페르소나 분석 — <span id="ai-panel-stock-name" style="color:var(--accent-cyan)"></span>
-        </div>
-        <button class="ai-panel-close" onclick="closeAiPanel()" title="닫기">✕</button>
-      </div>
-
-      <!-- Persona cards rendered here -->
-      <div id="ai-panel-content">
-        <!-- JS로 렌더링 -->
-      </div>
-
-    </div>
-  </div><!-- /ai-panel -->
-
-</div><!-- /app-wrapper -->
-
-<script src="app.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>
