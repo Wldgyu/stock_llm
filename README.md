@@ -125,13 +125,7 @@ Ollama 서버와 기본 `gemma4:12b` 모델을 준비한 뒤 실행합니다.
 & "C:\Users\dark0\miniconda3\envs\stock_ai_312\python.exe" llm_stock.py
 ```
 
-다른 Ollama 서버를 사용할 때:
-
-```powershell
-$env:OLLAMA_HOST="192.168.0.10"
-python llm_stock.py
-```
-
+다른 Ollama 서버를 사용할 때는 `.env`의 `OLLAMA_HOST`를 변경합니다.
 설정 가능한 환경변수:
 
 - `OLLAMA_HOST`: 기본값 `127.0.0.1`

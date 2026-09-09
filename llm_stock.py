@@ -19,9 +19,15 @@ import traceback
 import uuid
 import requests
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
+
 from database import DB_PATH as DEFAULT_DB_PATH, connect_db
+
+# 프로젝트의 비공개 Ollama·모델 설정을 환경변수로 불러옵니다.
+load_dotenv(Path(__file__).with_name(".env"))
 
 # ml_stock.py 에서 공통 유틸 및 V3 에이전트 import
 from ml_stock import StockAIAgentV3, get_next_trading_date
@@ -43,11 +49,11 @@ class MarketAgentSimulator:
 
     def __init__(
         self,
-        server_ip: str = "127.0.0.1",
+        server_ip: Optional[str] = None,
         expert_model: str = "gemma4:12b",
         decision_model: str = "gemma4:12b",
     ):
-        self.server_ip      = server_ip
+        self.server_ip      = server_ip or os.environ.get("OLLAMA_HOST", "127.0.0.1")
         self.expert_model   = expert_model
         self.decision_model = decision_model
         self.url            = f"http://{self.server_ip}:11434/api/generate"
@@ -253,7 +259,7 @@ class StockAIAgentV4(StockAIAgentV3):
 
     DB_PATH = DEFAULT_DB_PATH
 
-    def __init__(self, server_ip: str = "127.0.0.1"):
+    def __init__(self, server_ip: Optional[str] = None):
         super().__init__()  # StockAIAgentV3 초기화 (NLP 파이프라인 등)
 
         if not hasattr(self, "db_path"):
@@ -491,6 +497,5 @@ class StockAIAgentV4(StockAIAgentV3):
 # 단독 실행
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
-    ollama_host = os.environ.get("OLLAMA_HOST", '221.164.120.126')
-    agent = StockAIAgentV4(server_ip=ollama_host)
+    agent = StockAIAgentV4()
     agent.run()
