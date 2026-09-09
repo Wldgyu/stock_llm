@@ -53,7 +53,7 @@ class MarketAgentSimulator:
         self.url            = f"http://{self.server_ip}:11434/api/generate"
 
         self.personas = {
-            "주식전문가":     "계량적 분석 및 주가 차트 흐름 분석 전문가. 가격 예측, 현재 가격 추이, 2025년 가상 주식예측 시뮬레이션 데이터를 종합적으로 판단.",
+            "주식전문가":     "계량적 분석 및 주가 차트 흐름 분석 전문가. 가격 예측, 현재 가격 추이.",
             "뉴스기업전문가": "시장 뉴스 심리 및 기업 질적 평가 전문가. 최신 뉴스 3개와 기업 평가(뉴스 감정 점수, 백테스트 수익률, Sharpe, MDD 등)를 종합적으로 분석.",
             "최종결정자":     "최종 투자 의사결정권자. 주식전문가와 뉴스기업전문가의 분석 리포트를 수신하여 투자 방향(점수)과 최종 결정을 내리는 역할.",
         }
@@ -63,7 +63,7 @@ class MarketAgentSimulator:
         """Ollama 서버에 keep_alive=0 신호를 보내 KV 캐시 및 메모리를 강제 회수합니다."""
         payload = {"model": model_name, "keep_alive": 0}
         try:
-            requests.post(self.url, json=payload, timeout=10)
+            requests.post(self.url, json=payload, timeout=15)
             print(f"      🧹 VRAM 캐시 초기화 완료: {model_name}")
         except Exception as e:
             print(f"      ⚠️ VRAM 초기화 통신 오류: {e}")
@@ -77,6 +77,7 @@ class MarketAgentSimulator:
             f"당신은 주식 시장 가상 토론에 참여한 계량 분석 및 주가 기술 전문가 '주식전문가'입니다.\n"
             f"당신의 투자 철학: {description}\n"
             f"반드시 주어진 주가 정보와 예측 데이터에 기반하여 논리적인 의견을 전개하되, "
+            f"JSON 점수 줄을 제외한 분석 의견은 공백을 포함해 700자 미만으로 작성하세요.\n"
             f"출력 결과의 맨 마지막 줄에는 반드시 다른 텍스트 없이 JSON 형식으로만 점수를 적으세요.\n"
             f'JSON 포맷 예시: {{"score": 0.45}}\n'
             f"점수 범위는 -1.0(극단적 비관/매도)에서 +1.0(극단적 낙관/매수) 사이의 실수여야 합니다.\n<end_of_turn>\n"
@@ -100,6 +101,7 @@ class MarketAgentSimulator:
             f"당신은 주식 시장 가상 토론에 참여한 뉴스 심리 및 질적 분석 전문가 '뉴스기업전문가'입니다.\n"
             f"당신의 투자 철학: {description}\n"
             f"반드시 주어진 최신 뉴스 3개와 기업 평가 정보에 기반하여 논리적인 의견을 전개하되, "
+            f"JSON 점수 줄을 제외한 분석 의견은 공백을 포함해 700자 미만으로 작성하세요.\n"
             f"출력 결과의 맨 마지막 줄에는 반드시 다른 텍스트 없이 JSON 형식으로만 점수를 적으세요.\n"
             f'JSON 포맷 예시: {{"score": 0.45}}\n'
             f"점수 범위는 -1.0(극단적 비관)에서 +1.0(극단적 낙관) 사이의 실수여야 합니다.\n<end_of_turn>\n"
@@ -132,6 +134,8 @@ class MarketAgentSimulator:
             f"당신은 주식 시장 가상 토론의 최종 투자 의사 결정자인 '최종결정자'입니다.\n"
             f"당신의 투자 철학: {description}\n"
             f"주식전문가의 분석 의견과 뉴스기업전문가의 분석 의견을 종합하여 최종 결정을 내리세요. "
+            f"출력의 첫 줄은 반드시 '[요약] ' 으로 시작하는 핵심 한 줄 요약을 작성하세요.\n"
+            f"JSON 점수 줄을 제외한 전체 의견은 공백을 포함해 500자 이내로 작성하세요.\n"
             f"반드시 다른 텍스트 없이 출력 결과의 맨 마지막 줄에는 JSON 형식으로만 최종 합의 점수를 적으세요.\n"
             f'JSON 포맷 예시: {{"score": 0.45}}\n'
             f"점수 범위는 -1.0(강력 매도/비관)에서 +1.0(강력 매수/낙관) 사이의 실수여야 합니다.\n<end_of_turn>\n"
@@ -156,7 +160,7 @@ class MarketAgentSimulator:
             "keep_alive": "5s",
         }
         try:
-            response = requests.post(self.url, json=payload, timeout=300)
+            response = requests.post(self.url, json=payload, timeout=360)
             if response.status_code == 200:
                 return response.json().get("response", "").strip()
             else:
@@ -197,8 +201,8 @@ class MarketAgentSimulator:
                 return score
         return None
 
-    def parse_response(self, text: str):
-        """LLM 응답을 의견과 점수로 나누며 파싱 실패를 중립과 구분합니다."""
+    def parse_response(self, text: str, max_chars: Optional[int] = None):
+        """LLM 응답을 의견·요약·점수로 나누며 파싱 실패를 중립과 구분합니다."""
         score = self.parse_score_from_response(text)
         if not text:
             return "분석 실패: 응답 없음", None
@@ -210,8 +214,27 @@ class MarketAgentSimulator:
                 break
         opinion = opinion.strip("` \n")
         if score is None:
-            return f"분석 실패: 점수 파싱 오류\n{opinion}", None
+            opinion = f"분석 실패: 점수 파싱 오류\n{opinion}"
+        if max_chars is not None and len(opinion) > max_chars:
+            # 프롬프트를 벗어난 긴 응답도 DB 저장 전에 확실히 제한합니다.
+            opinion = opinion[:max_chars].rstrip()
+        if score is None:
+            return opinion, None
         return opinion or "의견 없음", score
+
+    @staticmethod
+    def extract_summary(opinion: str) -> str:
+        """의견 텍스트에서 [요약] 태그 한 줄을 추출합니다. 없으면 첫 문장을 사용합니다."""
+        for line in opinion.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("[요약]"):
+                return stripped[len("[요약]"):].strip()
+        # [요약] 태그가 없으면 첫 문장(마침표·쉼표 기준)을 fallback으로 사용
+        first = opinion.split("\n")[0].strip()
+        for sep in (".", "。", ","):
+            if sep in first:
+                return first[:first.index(sep) + 1]
+        return first[:80]
 
 
 # ──────────────────────────────────────────────
@@ -393,7 +416,9 @@ class StockAIAgentV4(StockAIAgentV3):
                 # Step 1: 주식전문가
                 print("   ▶️ [호출] 주식전문가 에이전트 요청 송신 중...")
                 stock_raw   = self.simulator.run_stock_expert(name, current_price_desc, prediction_info)
-                stock_opinion, stock_score = self.simulator.parse_response(stock_raw)
+                stock_opinion, stock_score = self.simulator.parse_response(
+                    stock_raw, max_chars=699
+                )
                 self.save_persona_result(
                     name, "주식전문가", stock_opinion, stock_score, run_id
                 )
@@ -402,7 +427,9 @@ class StockAIAgentV4(StockAIAgentV3):
                 # Step 2: 뉴스기업전문가
                 print("   ▶️ [호출] 뉴스기업전문가 에이전트 요청 송신 중...")
                 news_raw    = self.simulator.run_news_expert(name, combined_news, company_evaluation)
-                news_opinion, news_score = self.simulator.parse_response(news_raw)
+                news_opinion, news_score = self.simulator.parse_response(
+                    news_raw, max_chars=699
+                )
                 self.save_persona_result(
                     name, "뉴스기업전문가", news_opinion, news_score, run_id
                 )
@@ -413,7 +440,9 @@ class StockAIAgentV4(StockAIAgentV3):
                 final_raw   = self.simulator.run_final_decision_maker(
                     name, stock_opinion, stock_score, news_opinion, news_score
                 )
-                final_opinion, final_score = self.simulator.parse_response(final_raw)
+                final_opinion, final_score = self.simulator.parse_response(
+                    final_raw, max_chars=500
+                )
                 self.save_persona_result(
                     name, "최종결정자", final_opinion, final_score, run_id
                 )
@@ -431,28 +460,26 @@ class StockAIAgentV4(StockAIAgentV3):
                 )
                 print(f"\n🎭 [AI 에이전트 토론 및 최종 결정] (최종 의사결정 점수: {final_score_text})")
 
-                s_color   = "❌" if stock_score is None else ("🟢" if stock_score > 0.1 else ("🔴" if stock_score < -0.1 else "⚖️"))
-                s_short   = stock_opinion[:80].replace("\n", " ") + "..."
-                s_score_text = f"{stock_score:+.2f}점" if stock_score is not None else "분석 실패"
-                print(f"  {s_color} 주식전문가: {s_score_text} | {s_short}")
+                def _icon(score):
+                    if score is None: return "❌"
+                    if score > 0.1:   return "🟢"
+                    if score < -0.1:  return "🔴"
+                    return "⚖️"
 
-                n_color   = "❌" if news_score is None else ("🟢" if news_score > 0.1 else ("🔴" if news_score < -0.1 else "⚖️"))
-                n_short   = news_opinion[:80].replace("\n", " ") + "..."
-                n_score_text = f"{news_score:+.2f}점" if news_score is not None else "분석 실패"
-                print(f"  {n_color} 뉴스기업전문가: {n_score_text} | {n_short}")
+                def _score_text(score):
+                    return f"{score:+.2f}점" if score is not None else "분석 실패"
 
-                f_color   = "❌" if final_score is None else ("🟢" if final_score > 0.1 else ("🔴" if final_score < -0.1 else "⚖️"))
-                f_short   = final_opinion[:120].replace("\n", " ") + "..."
-                f_score_text = f"{final_score:+.2f}점" if final_score is not None else "분석 실패"
-                print(f"  {f_color} 최종결정자: {f_score_text} | {f_short}")
+                s_short = stock_opinion[:80].replace("\n", " ") + "..."
+                n_short = news_opinion[:80].replace("\n", " ") + "..."
+                f_summary = self.simulator.extract_summary(final_opinion)
 
-                print(f"\n🔮 예측 결과 및 백테스트 데이터")
-                if final_score is not None:
-                    final_adjusted_price = current_price * (1 + (final_score * 0.03))
-                    print(f"  - 에이전트 최종합의 예측가: {self.format_price(final_adjusted_price, is_krw)}")
-                else:
-                    print("  - 에이전트 최종합의 예측가: 분석 실패")
+                print(f"  {_icon(stock_score)} 주식전문가: {_score_text(stock_score)} | {s_short}")
+                print(f"  {_icon(news_score)}  뉴스기업전문가: {_score_text(news_score)} | {n_short}")
+                print(f"  {_icon(final_score)} 최종결정자: {_score_text(final_score)} | {f_summary}")
+
+                print(f"\n🔮 백테스트 데이터")
                 print(f"  - 전략 과거 수익률: {bt_ret:.2f}%")
+                print(f"  - Sharpe: {sharpe:.2f} | MDD: {mdd:.2f}%")
                 print(f"{'='*65}\n")
 
             except Exception as e:
@@ -464,6 +491,6 @@ class StockAIAgentV4(StockAIAgentV3):
 # 단독 실행
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
-    ollama_host = os.environ.get("OLLAMA_HOST", '125.134.140.98')
+    ollama_host = os.environ.get("OLLAMA_HOST", '221.164.120.126')
     agent = StockAIAgentV4(server_ip=ollama_host)
     agent.run()

@@ -7,11 +7,13 @@ SQLite의 ML/LLM 분석 결과와 yfinance 실시간 시세를 하나의 Flask �
 
 import json
 import os
+import re
 import threading
 import time
 from datetime import datetime
 
 import pandas as pd
+import requests as http_requests
 import yfinance as yf
 from flask import Flask, Response, jsonify, request, send_from_directory
 
@@ -37,8 +39,10 @@ app = Flask(__name__, static_folder=None)
 
 _price_cache = {}
 _candle_cache = {}
+_dynamic_watchlist = {}
 _cache_lock = threading.Lock()
 _poll_thread = None
+SYMBOL_PATTERN = re.compile(r"^[A-Z0-9.^=-]{1,24}$")
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +56,34 @@ def _to_float(value):
         return number if pd.notna(number) else None
     except (TypeError, ValueError):
         return None
+
+
+def _currency_for_symbol(symbol):
+    """검색 결과의 거래소 접미사로 표시 통화를 추정합니다."""
+    suffix_map = {
+        ".KS": "KRW",
+        ".KQ": "KRW",
+        ".T": "JPY",
+        ".HK": "HKD",
+        ".L": "GBP",
+        ".TO": "CAD",
+    }
+    return next(
+        (currency for suffix, currency in suffix_map.items() if symbol.endswith(suffix)),
+        "USD",
+    )
+
+
+def _register_dynamic_stock(name, symbol, currency, exchange):
+    """선택한 검색 종목을 일정 시간 실시간 갱신 대상에 추가합니다."""
+    with _cache_lock:
+        _dynamic_watchlist[symbol] = {
+            "name": name,
+            "symbol": symbol,
+            "currency": currency,
+            "exchange": exchange,
+            "last_used": time.time(),
+        }
 
 
 def _quote_for(name, meta):
@@ -113,7 +145,27 @@ def _quote_for(name, meta):
 
 def _poll_prices():
     while True:
-        for name, meta in WATCHLIST.items():
+        now = time.time()
+        with _cache_lock:
+            expired = [
+                symbol
+                for symbol, item in _dynamic_watchlist.items()
+                if now - item["last_used"] > 1800
+            ]
+            for symbol in expired:
+                _dynamic_watchlist.pop(symbol, None)
+                _price_cache.pop(symbol, None)
+            dynamic_items = [
+                (item["name"], item.copy())
+                for item in _dynamic_watchlist.values()
+            ]
+
+        targets = list(WATCHLIST.items()) + dynamic_items
+        seen_symbols = set()
+        for name, meta in targets:
+            if meta["symbol"] in seen_symbols:
+                continue
+            seen_symbols.add(meta["symbol"])
             try:
                 quote = _quote_for(name, meta)
                 if quote:
@@ -312,6 +364,12 @@ def _stock_payload(name, analysis=None, persona=None):
         "sentiment": analysis.get("sentiment"),
         "pred_low": analysis.get("pred_low"),
         "pred_high": analysis.get("pred_high"),
+        "lstm_t1": analysis.get("lstm_t1"),
+        "lstm_t4": analysis.get("lstm_t4"),
+        "lstm_t7": analysis.get("lstm_t7"),
+        "tabpfn_t1": analysis.get("tabpfn_t1"),
+        "tabpfn_t4": analysis.get("tabpfn_t4"),
+        "tabpfn_t7": analysis.get("tabpfn_t7"),
         "risk_score": analysis.get("risk_score"),
         "final_score": persona.get("score"),
         "final_opinion": persona.get("opinion", "")[:200],
@@ -337,6 +395,89 @@ def frontend_style():
     return send_from_directory(BASE_DIR, "style.css")
 
 
+@app.route("/api/search")
+def api_search():
+    """한국어 종목명, 영문명 또는 티커로 실제 거래 종목을 검색합니다."""
+    query = request.args.get("q", "").strip()
+    if not query:
+        return jsonify({"query": query, "results": []})
+    if len(query) > 80:
+        return jsonify({"error": "검색어는 80자 이내로 입력하세요."}), 400
+
+    results = []
+    seen_symbols = set()
+
+    def add_result(name, symbol, exchange, quote_type="EQUITY"):
+        symbol = str(symbol or "").strip().upper()
+        if not SYMBOL_PATTERN.fullmatch(symbol) or symbol in seen_symbols:
+            return
+        tracked_name = SYMBOL_TO_NAME.get(symbol)
+        results.append(
+            {
+                "name": tracked_name or str(name or symbol),
+                "symbol": symbol,
+                "exchange": str(exchange or ""),
+                "currency": _currency_for_symbol(symbol),
+                "quote_type": quote_type,
+                "tracked": tracked_name is not None,
+                "search_result": True,
+            }
+        )
+        seen_symbols.add(symbol)
+
+    # 기존 관심 종목은 한글 일부 검색도 바로 찾을 수 있게 먼저 확인합니다.
+    lowered_query = query.casefold()
+    for name, meta in WATCHLIST.items():
+        if lowered_query in name.casefold() or lowered_query in meta["symbol"].casefold():
+            add_result(name, meta["symbol"], meta["exchange"])
+
+    # 네이버 자동완성은 국내 종목의 한글명과 종목코드를 제공합니다.
+    try:
+        response = http_requests.get(
+            "https://ac.stock.naver.com/ac",
+            params={"q": query, "target": "stock"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        response.raise_for_status()
+        for item in response.json().get("items", []):
+            market = item.get("typeCode", "")
+            suffix = ".KS" if market == "KOSPI" else ".KQ" if market == "KOSDAQ" else ""
+            if suffix:
+                add_result(
+                    item.get("name"),
+                    f"{item.get('code', '')}{suffix}",
+                    item.get("typeName") or market,
+                )
+    except Exception as exc:
+        app.logger.warning("국내 종목 검색 실패: %s", exc)
+
+    # Yahoo Finance 검색은 미국을 포함한 해외 종목명과 티커를 처리합니다.
+    try:
+        search = yf.Search(
+            query,
+            max_results=10,
+            news_count=0,
+            lists_count=0,
+            include_research=False,
+            raise_errors=True,
+        )
+        for item in search.quotes:
+            quote_type = str(item.get("quoteType", "")).upper()
+            if quote_type not in {"EQUITY", "ETF", "INDEX"}:
+                continue
+            add_result(
+                item.get("longname") or item.get("shortname"),
+                item.get("symbol"),
+                item.get("exchDisp") or item.get("exchange"),
+                quote_type,
+            )
+    except Exception as exc:
+        app.logger.warning("해외 종목 검색 실패: %s", exc)
+
+    return jsonify({"query": query, "results": results[:10]})
+
+
 @app.route("/api/status")
 def api_status():
     connection = get_connection()
@@ -354,7 +495,10 @@ def api_status():
             else 0
         )
         with _cache_lock:
-            live_count = len(_price_cache)
+            live_count = sum(
+                meta["symbol"] in _price_cache for meta in WATCHLIST.values()
+            )
+            search_live_count = len(_dynamic_watchlist)
         return jsonify(
             {
                 "has_analysis": has_analysis,
@@ -362,6 +506,8 @@ def api_status():
                 "analysis_count": analysis_count,
                 "persona_count": persona_count,
                 "live_count": live_count,
+                "watchlist_count": len(WATCHLIST),
+                "search_live_count": search_live_count,
                 "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
         )
@@ -422,6 +568,12 @@ def api_stock_detail(name):
                     "sentiment": None,
                     "pred_low": None,
                     "pred_high": None,
+                    "lstm_t1": None,
+                    "lstm_t4": None,
+                    "lstm_t7": None,
+                    "tabpfn_t1": None,
+                    "tabpfn_t4": None,
+                    "tabpfn_t7": None,
                     "risk_score": None,
                 },
                 "history_count": len(history),
@@ -549,24 +701,52 @@ def api_live_watchlist():
 @app.route("/api/live/candles/<string:symbol>")
 def api_live_candles(symbol):
     symbol = symbol.upper()
-    if symbol not in SYMBOL_TO_NAME:
-        return jsonify({"error": f"지원하지 않는 종목입니다: {symbol}"}), 404
+    if not SYMBOL_PATTERN.fullmatch(symbol):
+        return jsonify({"error": f"올바르지 않은 종목 코드입니다: {symbol}"}), 400
 
     interval = request.args.get("interval", "1d")
     if interval not in INTERVAL_MAP:
         return jsonify({"error": f"지원하지 않는 구간입니다: {interval}"}), 400
 
+    known_name = SYMBOL_TO_NAME.get(symbol)
+    known_meta = WATCHLIST.get(known_name, {}) if known_name else {}
+    name = known_name or request.args.get("name", symbol).strip()[:100] or symbol
+    currency = known_meta.get("currency") or request.args.get(
+        "currency", _currency_for_symbol(symbol)
+    ).upper()[:8]
+    exchange = known_meta.get("exchange") or request.args.get(
+        "exchange", ""
+    ).strip()[:40]
+    meta = {
+        "symbol": symbol,
+        "currency": currency,
+        "exchange": exchange,
+    }
+    if not known_name:
+        _register_dynamic_stock(name, symbol, currency, exchange)
+
     cache_key = (symbol, interval)
     with _cache_lock:
         cached = _candle_cache.get(cache_key)
         quote = dict(_price_cache.get(symbol, {}))
+    if not quote:
+        try:
+            quote = _quote_for(name, meta) or {}
+            if quote:
+                with _cache_lock:
+                    _price_cache[symbol] = quote
+        except Exception as exc:
+            app.logger.warning("%s 검색 종목 시세 조회 실패: %s", symbol, exc)
     if cached and time.time() - cached["saved_at"] < 20:
         return jsonify({**cached["payload"], "meta": quote, "cached": True})
 
     period, yf_interval = INTERVAL_MAP[interval]
     try:
         frame = yf.Ticker(symbol).history(
-            period=period, interval=yf_interval, auto_adjust=True
+            period=period,
+            interval=yf_interval,
+            prepost=yf_interval != "1d",
+            auto_adjust=True,
         )
         if frame.empty:
             return jsonify({"symbol": symbol, "interval": interval, "candles": [], "meta": quote})

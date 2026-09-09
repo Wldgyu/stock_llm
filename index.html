@@ -29,10 +29,27 @@
       <header class="section-header">
         <h1 class="section-title">
           종목 현황
-          <span class="section-badge">6개 관심 종목</span>
+          <span class="section-badge" id="watchlist-count">6개 관심 종목</span>
         </h1>
         <span class="timestamp-label" id="last-update"></span>
       </header>
+      <section class="stock-search-section" aria-label="주식 검색">
+        <form class="stock-search-form" id="stock-search-form" role="search">
+          <span class="stock-search-icon" aria-hidden="true">⌕</span>
+          <input
+            class="stock-search-input"
+            id="stock-search-input"
+            type="search"
+            placeholder="종목명 또는 티커 검색 (예: 카카오, NVDA)"
+            autocomplete="off"
+            maxlength="80"
+            aria-label="종목명 또는 티커"
+          >
+          <button class="stock-search-button" type="submit">검색</button>
+        </form>
+        <div class="stock-search-status" id="stock-search-status"></div>
+        <div class="stock-search-results" id="stock-search-results" hidden></div>
+      </section>
       <div class="stocks-grid" id="stocks-grid" aria-live="polite"></div>
     </main>
 
@@ -102,8 +119,9 @@
         </section>
 
         <section class="prediction-section" id="prediction-section" aria-labelledby="prediction-title">
-          <h3 class="prediction-title" id="prediction-title">LSTM 가격 예측 범위</h3>
+          <h3 class="prediction-title" id="prediction-title">AI 모델 가격 예측</h3>
           <div class="prediction-cards" id="prediction-cards"></div>
+          <div class="model-prediction-details" id="model-prediction-details"></div>
         </section>
       </div>
     </main>

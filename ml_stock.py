@@ -10,11 +10,14 @@ ml_stock.py
 [단독 실행 시] python ml_stock.py
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, time as clock_time, timedelta
+from zoneinfo import ZoneInfo
 
 import warnings
 import traceback
 import urllib.parse
+import os
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -34,70 +37,37 @@ except ImportError:
 
 import torch
 import torch.nn as nn
+from dotenv import load_dotenv
 from sklearn.preprocessing import StandardScaler
 from transformers import pipeline
 
 from database import DB_PATH, connect_db
 
 # ── TabPFN / HuggingFace 인증 자동 로드 ──────────────────────
-import os as _os, re as _re, pathlib as _pl
+load_dotenv(Path(__file__).with_name(".env"))
 
-def _load_tabpfn_token(filename: str = "tabpfn_api.txt") -> bool:
-    """
-    같은 디렉터리의 tabpfn_api.txt 에서 TabPFN API 키를 읽어
-    환경변수 TABPFN_TOKEN 에 설정합니다.
 
-    지원 형식:
-        tabpfn_api = "tabpfn_sk_xxxx"
-        tabpfn_api = tabpfn_sk_xxxx
-    """
-    path = _pl.Path(__file__).parent / filename
-    if not path.exists():
-        print(f"⚠️ {filename} 파일을 찾을 수 없습니다.")
+def _load_tabpfn_token() -> bool:
+    """`.env`의 TABPFN_TOKEN 설정 여부를 확인합니다."""
+    token = os.environ.get("TABPFN_TOKEN", "").strip()
+    if not token:
+        print("⚠️ .env에 TABPFN_TOKEN이 설정되지 않았습니다.")
+        return False
+    print("✅ TabPFN 토큰 환경변수 로드 완료")
+    return True
+
+
+def _hf_login_from_env() -> bool:
+    """`.env`의 HF_TOKEN으로 Hugging Face 세션을 인증합니다."""
+    hf_token = os.environ.get("HF_TOKEN", "").strip()
+    if not hf_token:
+        print("⚠️ .env에 HF_TOKEN이 설정되지 않았습니다.")
         return False
     try:
-        text = path.read_text(encoding="utf-8").strip()
-        # 큰따옴표 안의 값을 우선 추출, 없으면 = 뒤 공백-제거 값 추출
-        m = _re.search(r'tabpfn_api\s*=\s*"([^"]+)"', text)
-        if not m:
-            m = _re.search(r"tabpfn_api\s*=\s*'([^']+)'", text)
-        if not m:
-            m = _re.search(r'tabpfn_api\s*=\s*(\S+)', text)
-        if not m:
-            print(f"⚠️ {filename} 에서 tabpfn_api 키를 파싱할 수 없습니다.")
-            return False
-        token = m.group(1).strip().strip('"').strip("'")
-        _os.environ["TABPFN_TOKEN"] = token
-        print(f"✅ TabPFN 토큰 로드 완료 (len={len(token)})")
-        return True
-    except Exception as e:
-        print(f"⚠️ {filename} 읽기 오류: {e}")
-        return False
+        from huggingface_hub import login as hf_login
 
-def _hf_login_from_file(filename: str = "tabpfn_api.txt") -> bool:
-    """
-    tabpfn_api.txt 에서 hf_token 을 읽어 HuggingFace 에 로그인합니다.
-    TabPFN 모델 가중치 다운로드(gated repo)에 필요합니다.
-
-    지원 형식 (tabpfn_api.txt 에 한 줄 추가):
-        hf_token = "hf_xxxx"
-    """
-    path = _pl.Path(__file__).parent / filename
-    if not path.exists():
-        return False
-    try:
-        text = path.read_text(encoding="utf-8")
-        m = _re.search(r'hf_token\s*=\s*"([^"]+)"', text)
-        if not m:
-            m = _re.search(r"hf_token\s*=\s*'([^']+)'", text)
-        if not m:
-            m = _re.search(r'hf_token\s*=\s*(\S+)', text)
-        if not m:
-            return False
-        hf_token = m.group(1).strip().strip('"').strip("'")
-        from huggingface_hub import login as _hf_login
-        _hf_login(token=hf_token, add_to_git_credential=False)
-        print(f"✅ HuggingFace 로그인 완료")
+        hf_login(token=hf_token, add_to_git_credential=False)
+        print("✅ HuggingFace 로그인 완료")
         return True
     except Exception as e:
         print(f"⚠️ HuggingFace 로그인 실패: {e}")
@@ -107,12 +77,12 @@ _AUTH_INITIALIZED = False
 
 
 def _ensure_model_auth():
-    """TabPFN을 실제 사용할 때만 로컬 인증정보를 읽습니다."""
+    """TabPFN을 실제 사용할 때 `.env` 인증정보를 적용합니다."""
     global _AUTH_INITIALIZED
     if _AUTH_INITIALIZED:
         return
     tabpfn_ready = _load_tabpfn_token()
-    huggingface_ready = _hf_login_from_file()
+    huggingface_ready = _hf_login_from_env()
     # 둘 다 실패하면 다음 종목에서 다시 시도할 수 있도록 False를 유지합니다.
     _AUTH_INITIALIZED = tabpfn_ready or huggingface_ready
 
@@ -202,7 +172,7 @@ class StockAIAgentV3:
       - RSI 기반 백테스트
       - Sharpe Ratio / MDD 성과 지표
       - LSTM 3-step 가격 예측 (T+1, T+4, T+7)
-      - SHAP 피처 중요도 시각화
+      - Integrated Gradients 피처 기여도 시각화
     """
 
     def __init__(self):
@@ -253,9 +223,25 @@ class StockAIAgentV3:
                     sent_label  TEXT,
                     pred_low    REAL,
                     pred_high   REAL,
+                    lstm_t1     REAL,
+                    lstm_t4     REAL,
+                    lstm_t7     REAL,
+                    tabpfn_t1   REAL,
+                    tabpfn_t4   REAL,
+                    tabpfn_t7   REAL,
                     risk_score  INTEGER
                 )
             """)
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(analysis_log)")
+            }
+            # 기존 DB에도 모델별 개별 예측 컬럼을 자동으로 추가합니다.
+            for column in (
+                "lstm_t1", "lstm_t4", "lstm_t7",
+                "tabpfn_t1", "tabpfn_t4", "tabpfn_t7",
+            ):
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE analysis_log ADD COLUMN {column} REAL")
             conn.commit()
         finally:
             conn.close()
@@ -268,6 +254,11 @@ class StockAIAgentV3:
         sentiment = float(result["sentiment"])
         sent_label = "긍정" if sentiment > 0.05 else ("부정" if sentiment < -0.05 else "중립")
         predictions = [float(value) for value in result["preds"]]
+        tabpfn_predictions = result.get("tabpfn_preds") or [None, None, None]
+        tabpfn_predictions = [
+            float(value) if value is not None else None
+            for value in tabpfn_predictions
+        ]
         recent = df.tail(20)
         volatility = float(df["Close"].pct_change().std() * np.sqrt(252) * 100)
         risk_score = min(10, max(1, int(round(volatility / 5))))
@@ -287,6 +278,12 @@ class StockAIAgentV3:
             sent_label,
             min(predictions),
             max(predictions),
+            predictions[0],
+            predictions[1],
+            predictions[2],
+            tabpfn_predictions[0],
+            tabpfn_predictions[1],
+            tabpfn_predictions[2],
             risk_score,
         )
         conn = connect_db(self.db_path)
@@ -295,8 +292,13 @@ class StockAIAgentV3:
                 INSERT INTO analysis_log (
                     timestamp, name, symbol, last_close, rsi, trend,
                     support, resistance, usd_krw, sox, sentiment,
-                    sent_label, pred_low, pred_high, risk_score
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    sent_label, pred_low, pred_high,
+                    lstm_t1, lstm_t4, lstm_t7,
+                    tabpfn_t1, tabpfn_t4, tabpfn_t7, risk_score
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?
+                )
             """, values)
             conn.commit()
         finally:
@@ -310,11 +312,11 @@ class StockAIAgentV3:
             return None
 
         df["RSI"] = ta.rsi(df["Close"], length=14)
-        bt_ret = self.backtest(df)
-        sharpe, mdd = self.calculate_performance_metrics(df)
+        bt_ret, equity = self.backtest(df)
+        sharpe, mdd    = self.calculate_performance_metrics(equity)
         sentiment, titles = self.get_realtime_sentiment(name)
         news_articles = self.get_financial_news_articles(name, symbol)
-        preds, model, last_seq, lstm_metrics = self.predict_multi_step(df)
+        preds, model, last_seq, baseline_seq, lstm_metrics = self.predict_multi_step(df)
         tabpfn_preds, tabpfn_metrics = self.predict_tabpfn(df)
 
         result = {
@@ -332,28 +334,81 @@ class StockAIAgentV3:
             "tabpfn_metrics": tabpfn_metrics,
             "model": model,
             "l_seq": last_seq,
+            "baseline_seq": baseline_seq,
         }
         self._save_analysis_result(name, result)
         print(f"✅ [{name}] ML 분석 및 DB 저장 완료.")
         return result
 
     # ── 데이터 수집 ──────────────────────────
+    @staticmethod
+    def _drop_incomplete_daily_bar(df: pd.DataFrame, symbol: str):
+        """거래소 정규장이 끝나기 전 생성된 당일 미완성 일봉을 제거합니다."""
+        if df.empty:
+            return df
+
+        is_korean = symbol.endswith((".KS", ".KQ"))
+        timezone = ZoneInfo("Asia/Seoul" if is_korean else "America/New_York")
+        market_close = clock_time(15, 30) if is_korean else clock_time(16, 0)
+        market_now = datetime.now(timezone)
+        latest_date = pd.Timestamp(df.index[-1]).date()
+
+        # 오늘 날짜의 행은 정규장 종료 전에는 종가가 확정되지 않았으므로 제외합니다.
+        local_time = market_now.time().replace(tzinfo=None)
+        if latest_date == market_now.date() and local_time < market_close:
+            print(
+                f"      ℹ️ {symbol} 미완성 당일 일봉({latest_date})을 제외합니다."
+            )
+            return df.iloc[:-1].copy()
+        return df
+
+    @staticmethod
+    def _macro_lags_for_symbol(symbol: str) -> dict:
+        """각 시장 마감 시점에 실제로 확정된 거시지표의 지연일을 반환합니다."""
+        is_korean = symbol.endswith((".KS", ".KQ"))
+        return {
+            "USD_KRW": 1,
+            "SOX_Index": 1 if is_korean else 0,
+        }
+
     def fetch_data(self, symbol: str):
         """yfinance로 1년치 일봉 + 환율(KRW=X) + SOX 지수를 다운로드합니다."""
-        df = yf.download(symbol, period="1y", interval="1d", progress=False)
+        df = yf.download(
+            symbol,
+            period="1y",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+        )
         if df.empty:
             return None
 
         # MultiIndex 컬럼 처리 (최신 yfinance 대응)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
+        df = self._drop_incomplete_daily_bar(df, symbol)
+        if df.empty:
+            return None
 
         # 매크로 데이터 병합
         macros = {"USD_KRW": "KRW=X", "SOX_Index": "^SOX"}
+        # 한국장은 미국장·FX 일봉보다 먼저 닫히므로 둘 다 전 거래일 값을 사용합니다.
+        # 미국장은 SOX와 동시에 닫혀 SOX 당일값은 사용하고, 늦게 마감되는 FX만 지연합니다.
+        macro_lags = self._macro_lags_for_symbol(symbol)
         for col_name, m_sym in macros.items():
-            m_data = yf.download(m_sym, period="1y", progress=False)['Close']
+            m_data = yf.download(
+                m_sym,
+                period="1y",
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+            )['Close']
             if isinstance(m_data, pd.DataFrame):
                 m_data = m_data.iloc[:, 0]
+            lag = macro_lags[col_name]
+            if lag:
+                # 값의 행을 미는 대신 사용 가능 날짜를 옮겨 서로 다른 시장 휴장일도 처리합니다.
+                m_data.index = m_data.index + pd.Timedelta(days=lag)
             df[col_name] = m_data
 
         # 과거 값으로만 채워 미래 데이터가 과거 행에 들어가는 누수를 막습니다.
@@ -361,6 +416,18 @@ class StockAIAgentV3:
         return df
 
     # ── 뉴스 감성 분석 ────────────────────────
+    @staticmethod
+    def _normalize_sentiment_score(label: str, confidence: float) -> float:
+        """모델 라벨을 부정(-), 중립(0), 긍정(+) 점수로 변환합니다."""
+        normalized_label = str(label).upper()
+        if normalized_label in {"NEGATIVE", "LABEL_0"}:
+            return -float(confidence)
+        if normalized_label == "NEUTRAL":
+            return 0.0
+        if normalized_label in {"POSITIVE", "LABEL_1"}:
+            return float(confidence)
+        return 0.0
+
     def get_realtime_sentiment(self, name: str):
         """Google News RSS에서 헤드라인을 수집하고 감성 점수를 반환합니다."""
         encoded_query = urllib.parse.quote(name)
@@ -375,11 +442,11 @@ class StockAIAgentV3:
         for t in titles:
             try:
                 res = pipe(t[:512])[0]
-                s = res['score']
-                # NSMC: LABEL_0=부정, FinBERT: NEGATIVE
-                if res['label'].upper() in ['NEGATIVE', 'LABEL_0']:
-                    s = -s
-                scores.append(s)
+                scores.append(
+                    self._normalize_sentiment_score(
+                        res.get("label", ""), res.get("score", 0.0)
+                    )
+                )
             except Exception:
                 continue
 
@@ -467,40 +534,63 @@ class StockAIAgentV3:
 
         return articles
 
-    # ── 성과 지표 ─────────────────────────────
-    def calculate_performance_metrics(self, df: pd.DataFrame):
-        """Sharpe Ratio 와 MDD(최대 낙폭)를 계산합니다."""
-        returns = df['Close'].pct_change().dropna()
+    # ── 성과 지표 ─────────────────────────────────────────────────
+    def calculate_performance_metrics(self, equity: pd.Series):
+        """
+        전략 잔고 곡선(equity)의 일간 수익률로
+        Sharpe Ratio 와 MDD(최대 낙폭)를 계산합니다.
+
+        equity: backtest()가 반환한 날짜별 잔고 금액 Series
+        """
+        returns = equity.pct_change().dropna()
         if len(returns) == 0:
-            return 0, 0
+            return 0.0, 0.0
         sharpe = (
             np.sqrt(252) * (returns.mean() - (0.03 / 252)) / returns.std()
-            if returns.std() != 0 else 0
+            if returns.std() != 0 else 0.0
         )
-        cum_rets    = (1 + returns).cumprod()
-        running_max = cum_rets.cummax()
-        mdd         = ((cum_rets - running_max) / running_max).min() * 100
-        return sharpe, mdd
+        # 잔고 곡선에서 직접 drawdown 계산 (첫날 고점 누락 방지)
+        running_max = equity.cummax()
+        mdd         = ((equity - running_max) / running_max).min() * 100
+        return float(sharpe), float(mdd)
 
-    # ── 백테스트 ──────────────────────────────
-    def backtest(self, df: pd.DataFrame) -> float:
-        """RSI 기반 단순 전략의 과거 수익률(%)을 계산합니다."""
+    # ── 백테스트 ─────────────────────────────────────────────────
+    def backtest(self, df: pd.DataFrame):
+        """
+        RSI 기반 단순 전략의 과거 수익률과 일일 잔고 곡선을 반환합니다.
+
+        체결 규칙:
+            전날 RSI 신호로 다음날 종가에 체결 (lookahead bias 방지).
+            i=0 은 신호 전날이므로 체결 없이 잔고만 기록합니다.
+
+        반환 값:
+            bt_ret (float)    : 전략 총수익률 (%)
+            equity (pd.Series): 날짜별 잔고 금액 — Sharpe · MDD 계산에 사용
+        """
         df = df.copy()
         df['RSI'] = ta.rsi(df['Close'], length=14)
         df = df.dropna(subset=['RSI'])
+
         init_bal = bal = 10_000_000
         pos = 0
+        equity_vals = []   # 날짜별 잔고 = 현금 + 보유 주식 평가액
+
         for i in range(len(df)):
             p = float(df['Close'].iloc[i])
-            r = float(df['RSI'].iloc[i])
-            if r < 35 and pos == 0:
-                pos = bal // p
-                bal -= pos * p
-            elif r > 65 and pos > 0:
-                bal += pos * p
-                pos = 0
-        final_val = bal + (pos * float(df['Close'].iloc[-1]))
-        return ((final_val - init_bal) / init_bal) * 100
+            # 전날 RSI 신호로 오늘 종가에 체결 (i=0 은 이전 신호가 없으므로 건너뜀)
+            if i > 0:
+                prev_r = float(df['RSI'].iloc[i - 1])
+                if prev_r < 35 and pos == 0:
+                    pos = bal // p
+                    bal -= pos * p
+                elif prev_r > 65 and pos > 0:
+                    bal += pos * p
+                    pos = 0
+            equity_vals.append(bal + pos * p)
+
+        equity = pd.Series(equity_vals, index=df.index, name="equity")
+        bt_ret = ((equity.iloc[-1] - init_bal) / init_bal) * 100
+        return bt_ret, equity
 
     # ── 모델 검증 공통 함수 ────────────────────
     @staticmethod
@@ -700,7 +790,9 @@ class StockAIAgentV3:
         final_preds = (
             preds_scaled * final_scaler.scale_[0] + final_scaler.mean_[0]
         ).astype(float).tolist()
-        return final_preds, final_model, last_seq, metrics
+        # Integrated Gradients 배경(baseline): 학습에 사용된 시퀀스들의 평균
+        baseline_seq = X_all.mean(dim=0, keepdim=True).detach()
+        return final_preds, final_model, last_seq, baseline_seq, metrics
 
     # ── TabPFN 예측 ───────────────────────────
     def predict_tabpfn(self, df: pd.DataFrame):
@@ -809,14 +901,65 @@ class StockAIAgentV3:
             print(f"      ⚠️ TabPFN 예측 실패: {e}")
             return None, None
 
-    # ── 피처 중요도 ───────────────────────────
-    def get_feature_importance(self, model, last_seq) -> dict:
-        """SHAP 근사 피처 중요도를 반환합니다 (현재 고정값)."""
-        return {"Price": 0.42, "USD_KRW": 0.28, "SOX Index": 0.30}
+    # ── 피처 기여도 (Integrated Gradients) ──
+    def get_feature_importance(
+        self, model, last_seq, baseline_seq=None
+    ) -> dict:
+        """
+        PyTorch Integrated Gradients로 T+1 예측에 대한
+        피처(Close·USD_KRW·SOX_Index) 기여도를 계산합니다.
 
-    # ── SHAP 시각화 ───────────────────────────
-    def visualize_shap(self, name: str, importance_dict: dict) -> str:
-        """피처 중요도를 수평 막대 차트로 저장하고 파일명을 반환합니다."""
+        last_seq   : (1, seq_len, n_feat) 텐서
+        baseline_seq: (1, seq_len, n_feat) 배경 시퀀스 평균
+                      None이면 영 텐서(zero baseline) 사용
+        반환       : {"Price": float, "USD_KRW": float, "SOX Index": float}
+        """
+        feature_names = ["Price", "USD_KRW", "SOX Index"]
+        try:
+            model.eval()
+            inp = last_seq.clone().float()
+            if baseline_seq is None:
+                baseline = torch.zeros_like(inp)
+            else:
+                baseline = baseline_seq.clone().float().to(inp.device)
+
+            n_steps = 50
+            # 배경 → 입력 사이의 직선 보간 경로를 n_steps개 샘플
+            alphas = torch.linspace(0.0, 1.0, n_steps, device=inp.device)
+            interp = baseline + alphas.view(-1, 1, 1) * (inp - baseline)  # (n_steps, seq, feat)
+            interp = interp.requires_grad_(True)
+
+            # T+1 예측(출력 인덱스 0)의 합으로 스칼라 생성
+            outputs = model(interp)[:, 0]  # (n_steps,)
+
+            # IG = (inp - baseline) * mean_gradient  → (seq_len, n_feat)
+            grads = torch.autograd.grad(outputs.sum(), interp)[0]
+            mean_grads = grads.mean(dim=0)  # (seq_len, n_feat)
+            ig = (inp.squeeze(0) - baseline.squeeze(0)) * mean_grads  # (seq_len, n_feat)
+
+            # 20일 축 합산 → 피처별 기여도 (n_feat,)
+            feat_contrib = ig.abs().sum(dim=0).detach().cpu().numpy()  # (n_feat,)
+
+            total = feat_contrib.sum()
+            if total > 0:
+                feat_contrib = feat_contrib / total
+            else:
+                feat_contrib = np.zeros(len(feature_names))
+
+            return dict(zip(feature_names, feat_contrib.tolist()))
+
+        except Exception as e:
+            print(f"      ⚠️ Integrated Gradients 계산 실패: {e}")
+            # 실패 시 가짜 고정 중요도를 만들지 않습니다.
+            return {}
+
+    # ── 기여도 시각화 ─────────────────────────
+    def visualize_feature_importance(
+        self, name: str, importance_dict: dict
+    ) -> str | None:
+        """피처 기여도를 수평 막대 차트로 저장하고 파일명을 반환합니다."""
+        if not importance_dict:
+            return None
         features   = list(importance_dict.keys())
         values     = list(importance_dict.values())
         sorted_idx = np.argsort(values)
@@ -826,10 +969,11 @@ class StockAIAgentV3:
         plt.figure(figsize=(10, 6))
         colors = plt.cm.GnBu(np.linspace(0.4, 0.8, len(values)))
         plt.barh(features, values, color=colors)
-        plt.title(f"AI Decision Logic (SHAP) - {name}")
+        plt.title(f"이번 예측 기여도 - {name}")
+        plt.xlabel("정규화된 기여도 (Integrated Gradients)")
         plt.tight_layout()
 
-        filename = f"shap_analysis_{name}.png"
+        filename = f"contribution_{name}.png"
         plt.savefig(filename)
         plt.close()
         return filename
@@ -854,8 +998,10 @@ class StockAIAgentV3:
                 tabpfn_preds = result["tabpfn_preds"]
                 lstm_metrics = result["lstm_metrics"]
                 tabpfn_metrics = result["tabpfn_metrics"]
-                imp = self.get_feature_importance(result["model"], result["l_seq"])
-                chart_file          = self.visualize_shap(name, imp)
+                imp = self.get_feature_importance(
+                    result["model"], result["l_seq"], result.get("baseline_seq")
+                )
+                chart_file = self.visualize_feature_importance(name, imp)
 
                 print(f"{'='*65}")
                 print(f"🚀 [AI Agent V3.2 리포트: {name} ({symbol})]")
@@ -867,7 +1013,12 @@ class StockAIAgentV3:
 
                 print(f"📊 현재가: {last_p:,.0f} | 추세: {trend} (RSI: {rsi_v:.2f})")
                 print(f"📈 전략 수익률: {bt_ret:.2f}% | Sharpe: {sharpe:.2f} | MDD: {mdd:.2f}%")
-                print(f"📰 뉴스 심리: {'긍정' if sentiment > 0.05 else '부정'} (Score: {sentiment:.2f})")
+                sentiment_label = (
+                    "긍정" if sentiment > 0.05
+                    else "부정" if sentiment < -0.05
+                    else "중립"
+                )
+                print(f"📰 뉴스 심리: {sentiment_label} (Score: {sentiment:.2f})")
                 if news_articles:
                     for article in news_articles:
                         print(
@@ -899,7 +1050,10 @@ class StockAIAgentV3:
                 else:
                     print(f"🔮 [TabPFN] 예보: 사용 불가")
 
-                print(f"🔍 시각화 완료: {chart_file}")
+                if chart_file:
+                    print(f"🔍 실제 피처 기여도 시각화 완료: {chart_file}")
+                else:
+                    print("⚠️ 피처 기여도 계산 실패로 시각화를 건너뜁니다.")
                 print(f"{'='*65}\n")
 
             except Exception as e:
@@ -928,6 +1082,7 @@ class StockAIAgentV3:
                     "tabpfn_metrics": dict | None,
                     "model": LSTMModel,
                     "l_seq": Tensor,
+                    "baseline_seq": Tensor,  # IG 배경 시퀀스 (학습 구간 평균)
                 }
             }
         """

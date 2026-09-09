@@ -4,11 +4,13 @@ __pycache__/
 # 로컬 데이터 및 생성 결과
 stock_analysis.db
 shap_analysis_*.png
+contribution_*.png
 
 # API 키와 모델 인증 정보
 tabpfn_api.txt
 .env
 .env.*
+!.env.example
 
 # 로컬 분석 파일 및 설정
 CODE_ANALYSIS.txt

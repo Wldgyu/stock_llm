@@ -29,11 +29,15 @@ ver1_1.py           구버전 참고용 코드
 - TabPFN은 T+1, T+4, T+7별로 별도 회귀 모델을 학습합니다.
 - 두 모델 모두 테스트 구간의 MAE, RMSE, MAPE를 계산합니다.
 - 검증이 끝난 뒤 최종 예측 모델은 전체 과거 데이터로 다시 학습합니다.
+- 거래소 정규장 종료 전에는 당일 미완성 일봉을 학습 데이터에서 제외합니다.
 - 거시지표 결측치는 과거 값으로만 채워 미래 데이터가 섞이는 `bfill` 누수를 제거했습니다.
+- 한국 종목은 환율·SOX를 1거래일 지연하고, 미국 종목은 환율만 1거래일 지연합니다.
+- LSTM의 T+1 예측 기여도는 Integrated Gradients로 실제 계산합니다.
 
 ### 뉴스 분석
 
 - 일반 뉴스 감성 점수는 Google News 최신 제목 최대 5개로 계산합니다.
+- FinBERT의 `NEUTRAL` 라벨은 긍정값이 아닌 `0.0`으로 계산합니다.
 - LLM 뉴스 전문가는 다음 금융 언론사의 최신 기사 한 건씩을 구분하여 분석합니다.
   - Bloomberg
   - Wall Street Journal(WSJ)
@@ -87,11 +91,11 @@ conda activate stock_ai_312
 공개 감성 모델과 LSTM만 사용할 때는 Hugging Face 토큰이 필수는 아닙니다.
 TabPFN 모델 또는 제한된 모델 저장소를 사용할 때는 유효한 토큰이 필요할 수 있습니다.
 
-프로젝트 폴더의 Git 제외 파일인 `tabpfn_api.txt` 형식:
+`.env.example`을 `.env`로 복사한 뒤 실제 토큰을 입력합니다.
 
 ```text
-tabpfn_api = "tabpfn_sk_xxxx"
-hf_token = "hf_xxxx"
+TABPFN_TOKEN=tabpfn_token_here
+HF_TOKEN=hf_token_here
 ```
 
 Hugging Face 토큰을 로컬 환경에 등록하려면:
@@ -100,7 +104,7 @@ Hugging Face 토큰을 로컬 환경에 등록하려면:
 hf auth login
 ```
 
-토큰을 Python 코드에 직접 작성하거나 Git에 커밋하지 마세요.
+`.env`는 Git에서 제외됩니다. 토큰을 Python 코드에 직접 작성하거나 Git에 커밋하지 마세요.
 
 ## 실행 순서
 
@@ -152,7 +156,7 @@ python delete_sqlite.py --yes
 - 제목 기반 감성 점수는 기사 전체 문맥을 반영하지 못할 수 있습니다.
 - 모델 검증은 시간순 단일 분할이며 아직 walk-forward 검증을 사용하지 않습니다.
 - 거래 수수료, 세금, 슬리피지와 실제 주문 체결 가능성은 반영하지 않습니다.
-- `get_feature_importance()`는 현재 실제 SHAP 계산이 아닌 고정된 참고값입니다.
+- Integrated Gradients 기여도는 모델의 인과관계를 증명하지 않고 현재 입력에 대한 민감도를 설명합니다.
 - 결과는 미래 수익을 보장하지 않으며 투자 자문이 아닙니다.
 
 

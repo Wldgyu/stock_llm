@@ -4,7 +4,9 @@ const state = {
   stocks: [],
   currentName: null,
   currentSymbol: null,
+  currentExchange: "",
   currency: "USD",
+  searchResults: [],
   interval: "1d",
   priceChart: null,
   rsiChart: null,
@@ -94,8 +96,11 @@ async function loadStatus() {
   try {
     const data = await fetchJson(`${API}/api/status`);
     $("status-dot").classList.remove("offline");
+    const searchCount = data.search_live_count
+      ? ` · 검색 ${data.search_live_count}개`
+      : "";
     $("status-text").textContent =
-      `분석 ${data.analysis_count}건 · AI ${data.persona_count}건 · 실시간 ${data.live_count}/6`;
+      `분석 ${data.analysis_count}건 · AI ${data.persona_count}건 · 실시간 ${data.live_count}/${data.watchlist_count || 6}${searchCount}`;
     $("server-time").textContent = data.server_time?.slice(11) || "--:--:--";
   } catch {
     $("status-dot").classList.add("offline");
@@ -191,6 +196,66 @@ async function loadStocks() {
         <h3>서버에서 종목을 불러오지 못했습니다.</h3>
         <p>${escapeHtml(error.message)}</p>
       </div>`;
+  }
+}
+
+function clearSearchResults() {
+  state.searchResults = [];
+  $("stock-search-results").hidden = true;
+  $("stock-search-results").innerHTML = "";
+}
+
+function renderSearchResults(results) {
+  const container = $("stock-search-results");
+  state.searchResults = results;
+  if (!results.length) {
+    container.hidden = true;
+    container.innerHTML = "";
+    return;
+  }
+
+  container.innerHTML = results.map((stock, index) => `
+    <button class="stock-search-result" type="button" data-search-index="${index}">
+      <span class="search-result-name">
+        <strong>${escapeHtml(stock.name)}</strong>
+        <span class="search-result-symbol">${escapeHtml(stock.symbol)}</span>
+      </span>
+      <span class="search-result-meta">
+        ${stock.tracked ? '<span class="search-result-tracked">분석 종목</span>' : ""}
+        <span>${escapeHtml(stock.exchange || stock.quote_type || "")}</span>
+      </span>
+    </button>
+  `).join("");
+  container.hidden = false;
+
+  container.querySelectorAll("[data-search-index]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const stock = state.searchResults[Number(button.dataset.searchIndex)];
+      clearSearchResults();
+      openDetail(stock);
+    });
+  });
+}
+
+async function searchStocks() {
+  const query = $("stock-search-input").value.trim();
+  if (!query) {
+    $("stock-search-status").textContent = "";
+    clearSearchResults();
+    return;
+  }
+
+  $("stock-search-status").textContent = "종목 검색 중...";
+  clearSearchResults();
+  try {
+    const data = await fetchJson(`${API}/api/search?q=${encodeURIComponent(query)}`);
+    const results = data.results || [];
+    renderSearchResults(results);
+    $("stock-search-status").textContent = results.length
+      ? `${results.length}개 종목을 찾았습니다.`
+      : "검색 결과가 없습니다. 종목명 또는 티커를 확인하세요.";
+  } catch (error) {
+    $("stock-search-status").textContent = `검색 실패: ${error.message}`;
   }
 }
 
@@ -293,29 +358,56 @@ function renderAnalysis(data) {
 function renderPredictions(latest, currency) {
   const low = latest.pred_low;
   const high = latest.pred_high;
-  if (low == null || high == null) {
+  const lstmValues = [latest.lstm_t1, latest.lstm_t4, latest.lstm_t7];
+  const tabpfnValues = [latest.tabpfn_t1, latest.tabpfn_t4, latest.tabpfn_t7];
+  const hasRange = low != null && high != null;
+  const hasLstmDetails = lstmValues.some((value) => value != null);
+  const hasTabpfnDetails = tabpfnValues.some((value) => value != null);
+
+  if (!hasRange && !hasLstmDetails && !hasTabpfnDetails) {
     $("prediction-section").hidden = true;
     $("prediction-cards").innerHTML = "";
+    $("model-prediction-details").innerHTML = "";
     return;
   }
   $("prediction-section").hidden = false;
-  const middle = (Number(low) + Number(high)) / 2;
-  $("prediction-cards").innerHTML = `
+  const middle = hasRange ? (Number(low) + Number(high)) / 2 : null;
+  $("prediction-cards").innerHTML = hasRange ? `
     <div class="prediction-card">
-      <span class="pred-day">예측 하단</span>
+      <span class="pred-day">LSTM 예측 하단</span>
       <strong class="pred-price down">${formatPrice(low, currency)}</strong>
       <span class="pred-range">T+1 · T+4 · T+7 최솟값</span>
     </div>
     <div class="prediction-card">
-      <span class="pred-day">예측 중앙</span>
+      <span class="pred-day">LSTM 예측 중앙</span>
       <strong class="pred-price">${formatPrice(middle, currency)}</strong>
       <span class="pred-range">예측 범위 중앙값</span>
     </div>
     <div class="prediction-card">
-      <span class="pred-day">예측 상단</span>
+      <span class="pred-day">LSTM 예측 상단</span>
       <strong class="pred-price up">${formatPrice(high, currency)}</strong>
       <span class="pred-range">T+1 · T+4 · T+7 최댓값</span>
+    </div>` : "";
+
+  const renderModelRow = (label, values, className) => `
+    <div class="model-prediction-row ${className}">
+      <strong class="model-prediction-name">${label}</strong>
+      ${values.map((value, index) => `
+        <span class="model-prediction-item">
+          <small>${["1일 뒤", "4일 뒤", "7일 뒤"][index]}</small>
+          <b>${formatPrice(value, currency)}</b>
+        </span>
+      `).join("")}
     </div>`;
+
+  const detailRows = [];
+  if (hasLstmDetails) {
+    detailRows.push(renderModelRow("LSTM", lstmValues, "lstm-model-row"));
+  }
+  if (hasTabpfnDetails) {
+    detailRows.push(renderModelRow("TabPFN", tabpfnValues, "tabpfn-model-row"));
+  }
+  $("model-prediction-details").innerHTML = detailRows.join("");
 }
 
 function resetDetail() {
@@ -326,6 +418,7 @@ function resetDetail() {
   ).join("");
   $("live-kpis").innerHTML = "";
   $("prediction-cards").innerHTML = '<div class="skeleton prediction-skeleton"></div>';
+  $("model-prediction-details").innerHTML = "";
   $("analysis-message").textContent = "";
   $("analysis-close").textContent = "";
   setChartLoading(true);
@@ -337,6 +430,7 @@ async function openDetail(stock) {
   if (!stock) return;
   state.currentName = stock.name;
   state.currentSymbol = stock.symbol;
+  state.currentExchange = stock.exchange || "";
   state.currency = stock.currency || (stock.symbol?.endsWith(".KS") ? "KRW" : "USD");
   state.interval = "1d";
   state.requestId += 1;
@@ -352,17 +446,26 @@ async function openDetail(stock) {
   updateDetailQuote(stock);
 
   loadCandles(requestId);
-  try {
-    const data = await fetchJson(`${API}/api/stock/${encodeURIComponent(stock.name)}`);
-    if (requestId !== state.requestId) return;
-    state.currentSymbol = data.symbol || state.currentSymbol;
-    state.currency = data.currency || state.currency;
-    renderAnalysis(data);
-  } catch (error) {
-    if (requestId === state.requestId) {
-      $("analysis-message").textContent = error.message;
-      renderAnalysis({ latest: {}, currency: state.currency, message: error.message });
+  const hasBatchAnalysis = stock.tracked !== false;
+  $("ai-button").hidden = !hasBatchAnalysis;
+  if (hasBatchAnalysis) {
+    try {
+      const data = await fetchJson(`${API}/api/stock/${encodeURIComponent(stock.name)}`);
+      if (requestId !== state.requestId) return;
+      state.currentSymbol = data.symbol || state.currentSymbol;
+      state.currency = data.currency || state.currency;
+      renderAnalysis(data);
+    } catch (error) {
+      if (requestId === state.requestId) {
+        $("analysis-message").textContent = error.message;
+        renderAnalysis({ latest: {}, currency: state.currency, message: error.message });
+      }
     }
+  } else {
+    $("analysis-section").hidden = true;
+    $("prediction-section").hidden = true;
+    $("detail-trend").textContent = "🔎 검색 종목";
+    $("analysis-close").textContent = "ML·LLM 배치 분석 데이터 없음";
   }
 
   clearInterval(state.candleTimer);
@@ -397,8 +500,14 @@ async function loadCandles(requestId = state.requestId, showLoading = true) {
   if (!state.currentSymbol) return;
   if (showLoading) setChartLoading(true);
   try {
+    const params = new URLSearchParams({
+      interval: state.interval,
+      name: state.currentName || state.currentSymbol,
+      currency: state.currency,
+      exchange: state.currentExchange,
+    });
     const data = await fetchJson(
-      `${API}/api/live/candles/${encodeURIComponent(state.currentSymbol)}?interval=${state.interval}`
+      `${API}/api/live/candles/${encodeURIComponent(state.currentSymbol)}?${params}`
     );
     if (requestId !== state.requestId) return;
     const candles = data.candles || [];
@@ -588,6 +697,7 @@ function goHome() {
   state.requestId += 1;
   state.currentName = null;
   state.currentSymbol = null;
+  state.currentExchange = "";
   clearInterval(state.candleTimer);
   destroyCharts();
   closeAiPanel();
@@ -599,6 +709,16 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("back-button").addEventListener("click", goHome);
   $("ai-button").addEventListener("click", () => state.aiOpen ? closeAiPanel() : openAiPanel());
   $("ai-close-button").addEventListener("click", closeAiPanel);
+  $("stock-search-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    searchStocks();
+  });
+  $("stock-search-input").addEventListener("input", (event) => {
+    if (!event.target.value.trim()) {
+      $("stock-search-status").textContent = "";
+      clearSearchResults();
+    }
+  });
   $("interval-bar").addEventListener("click", (event) => {
     const button = event.target.closest(".interval-btn");
     if (!button || button.dataset.interval === state.interval) return;
