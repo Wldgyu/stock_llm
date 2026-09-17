@@ -209,6 +209,11 @@ def _calculate_indicators(frame):
     loss = (-delta.clip(upper=0)).rolling(14).mean()
     relative_strength = gain / (loss + 1e-9)
     frame["RSI"] = 100 - (100 / (1 + relative_strength))
+    fast = close.ewm(span=12, adjust=False, min_periods=12).mean()
+    slow = close.ewm(span=26, adjust=False, min_periods=26).mean()
+    frame["MACD"] = fast - slow
+    frame["MACD_SIGNAL"] = frame["MACD"].ewm(span=9, adjust=False, min_periods=9).mean()
+    frame["MACD_OSC"] = frame["MACD"] - frame["MACD_SIGNAL"]
     return frame
 
 
@@ -235,6 +240,9 @@ def _frame_to_candles(frame):
                 "bb_up": _to_float(row.get("BB_UP")),
                 "bb_low": _to_float(row.get("BB_LOW")),
                 "rsi": _to_float(row.get("RSI")),
+                "macd": _to_float(row.get("MACD")),
+                "macd_signal": _to_float(row.get("MACD_SIGNAL")),
+                "macd_osc": _to_float(row.get("MACD_OSC")),
             }
         )
     return candles
@@ -277,16 +285,21 @@ def _latest_analysis_map(connection):
 def _latest_persona_map(connection):
     if not table_exists(connection, "persona_discussion_log"):
         return {}
+    if not table_exists(connection, "analysis_log"):
+        return {}
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(persona_discussion_log)")}
+    if "analysis_id" not in columns:
+        return {}  # 기존 기록은 ML과의 연결을 추측하지 않습니다.
     rows = connection.execute(
         """
         SELECT p.ticker_name, p.score, p.opinion, p.timestamp
         FROM persona_discussion_log p
-        INNER JOIN (
-            SELECT ticker_name, MAX(id) AS latest_id
-            FROM persona_discussion_log
-            WHERE persona='최종결정자'
-            GROUP BY ticker_name
-        ) latest ON latest.latest_id = p.id
+        JOIN (SELECT name, MAX(id) AS id FROM analysis_log GROUP BY name) a
+          ON p.analysis_id=a.id AND p.ticker_name=a.name
+        WHERE p.persona='최종결정자'
+          AND p.id=(SELECT MAX(q.id) FROM persona_discussion_log q
+                    WHERE q.analysis_id=a.id AND q.ticker_name=a.name
+                      AND q.persona='최종결정자')
         """
     ).fetchall()
     return {
@@ -314,6 +327,39 @@ def _trend(value, mode="rsi"):
         if value < -0.1:
             return "🔴", "매도 우세"
     return "⚖️", "중립"
+
+
+def _model_validation_payload(analysis):
+    """DB의 모델 검증 JSON을 API에서 사용할 구조로 변환합니다."""
+    models = {}
+    for model_name, column in (
+        ("lstm", "lstm_metrics_json"),
+        ("tabpfn", "tabpfn_metrics_json"),
+    ):
+        raw_metrics = analysis.get(column)
+        if not raw_metrics:
+            continue
+        try:
+            metrics = (
+                raw_metrics
+                if isinstance(raw_metrics, dict)
+                else json.loads(raw_metrics)
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(metrics, dict):
+            models[model_name] = metrics
+
+    warnings = [
+        metrics["baseline_warning"]
+        for metrics in models.values()
+        if metrics.get("baseline_warning")
+    ]
+    return {
+        "models": models,
+        "warnings": warnings,
+        "has_warning": bool(warnings),
+    }
 
 
 def _stock_payload(name, analysis=None, persona=None):
@@ -361,7 +407,6 @@ def _stock_payload(name, analysis=None, persona=None):
         "resistance": analysis.get("resistance"),
         "usd_krw": analysis.get("usd_krw"),
         "sox": analysis.get("sox"),
-        "sentiment": analysis.get("sentiment"),
         "pred_low": analysis.get("pred_low"),
         "pred_high": analysis.get("pred_high"),
         "lstm_t1": analysis.get("lstm_t1"),
@@ -370,7 +415,10 @@ def _stock_payload(name, analysis=None, persona=None):
         "tabpfn_t1": analysis.get("tabpfn_t1"),
         "tabpfn_t4": analysis.get("tabpfn_t4"),
         "tabpfn_t7": analysis.get("tabpfn_t7"),
+        "model_validation": _model_validation_payload(analysis),
         "risk_score": analysis.get("risk_score"),
+        "analysis_id": analysis.get("id"),
+        "llm_status": ("failed" if persona.get("score") is None else "complete") if persona else "unavailable",
         "final_score": persona.get("score"),
         "final_opinion": persona.get("opinion", "")[:200],
         "source": "+".join(source_parts) or "none",
@@ -554,28 +602,33 @@ def api_stock_detail(name):
             ]
 
         stock = _stock_payload(name, analysis, persona)
+        latest = dict(analysis) if analysis else {
+            "name": name,
+            "symbol": stock["symbol"],
+            "last_close": None,
+            "rsi": None,
+            "support": None,
+            "resistance": None,
+            "usd_krw": None,
+            "sox": None,
+            "pred_low": None,
+            "pred_high": None,
+            "lstm_t1": None,
+            "lstm_t4": None,
+            "lstm_t7": None,
+            "tabpfn_t1": None,
+            "tabpfn_t4": None,
+            "tabpfn_t7": None,
+            "risk_score": None,
+        }
+        latest.pop("sentiment", None)
+        latest.pop("sent_label", None)
+        latest.pop("lstm_metrics_json", None)
+        latest.pop("tabpfn_metrics_json", None)
+        latest["model_validation"] = stock["model_validation"]
         stock.update(
             {
-                "latest": analysis or {
-                    "name": name,
-                    "symbol": stock["symbol"],
-                    "last_close": None,
-                    "rsi": None,
-                    "support": None,
-                    "resistance": None,
-                    "usd_krw": None,
-                    "sox": None,
-                    "sentiment": None,
-                    "pred_low": None,
-                    "pred_high": None,
-                    "lstm_t1": None,
-                    "lstm_t4": None,
-                    "lstm_t7": None,
-                    "tabpfn_t1": None,
-                    "tabpfn_t4": None,
-                    "tabpfn_t7": None,
-                    "risk_score": None,
-                },
+                "latest": latest,
                 "history_count": len(history),
                 "analysis_chart": {
                     "labels": [row.get("timestamp", "")[:16] for row in reversed(history)],
@@ -591,6 +644,18 @@ def api_stock_detail(name):
         connection.close()
 
 
+@app.route("/api/stock/<string:name>/t1-history")
+def api_t1_history(name):
+    from forecast_tracking import t1_history
+    connection = get_connection()
+    try:
+        if not table_exists(connection, "analysis_log"):
+            return jsonify({"history": []})
+        return jsonify({"history": t1_history(connection, name)})
+    finally:
+        connection.close()
+
+
 @app.route("/api/stock/<string:name>/ai")
 def api_stock_ai(name):
     connection = get_connection()
@@ -598,52 +663,20 @@ def api_stock_ai(name):
         if not table_exists(connection, "persona_discussion_log"):
             return jsonify({"error": "AI 분석 결과가 없습니다. llm_stock.py를 먼저 실행하세요."}), 404
 
-        columns = {
-            row["name"]
-            for row in connection.execute(
-                "PRAGMA table_info(persona_discussion_log)"
-            ).fetchall()
-        }
-        latest_run = None
-        if "run_id" in columns:
-            latest_run = connection.execute(
-                """
-                SELECT run_id
-                FROM persona_discussion_log
-                WHERE ticker_name=? AND persona='최종결정자'
-                  AND run_id IS NOT NULL
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (name,),
-            ).fetchone()
-
-        if latest_run:
-            rows = connection.execute(
-                """
-                SELECT *
-                FROM persona_discussion_log
-                WHERE ticker_name=? AND run_id=?
-                ORDER BY id
-                """,
-                (name, latest_run["run_id"]),
-            ).fetchall()
-        else:
-            # run_id가 없는 기존 데이터는 페르소나별 최신 행을 사용합니다.
-            rows = connection.execute(
-                """
-                SELECT p.*
-                FROM persona_discussion_log p
-                INNER JOIN (
-                    SELECT persona, MAX(id) AS latest_id
-                    FROM persona_discussion_log
-                    WHERE ticker_name=?
-                    GROUP BY persona
-                ) latest ON latest.latest_id=p.id
-                ORDER BY p.id
-                """,
-                (name,),
-            ).fetchall()
+        analysis = _latest_analysis_map(connection).get(name)
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(persona_discussion_log)")}
+        if not analysis or "analysis_id" not in columns:
+            return jsonify({"error": "현재 ML 분석에 연결된 LLM 결과가 없습니다. LLM 분석을 실행하세요."}), 404
+        latest_run = connection.execute(
+            "SELECT run_id FROM persona_discussion_log WHERE ticker_name=? AND analysis_id=? ORDER BY id DESC LIMIT 1",
+            (name, analysis["id"]),
+        ).fetchone()
+        if not latest_run:
+            return jsonify({"error": "현재 ML 분석의 LLM 결과가 없습니다. 분석 대기 또는 실행 실패 상태입니다."}), 404
+        rows = connection.execute(
+            "SELECT * FROM persona_discussion_log WHERE ticker_name=? AND analysis_id=? AND run_id=? ORDER BY id",
+            (name, analysis["id"], latest_run["run_id"]),
+        ).fetchall()
         if not rows:
             return jsonify({"error": f"'{name}' AI 분석 결과가 없습니다."}), 404
 
@@ -798,3 +831,4 @@ if __name__ == "__main__":
         threaded=True,
         use_reloader=False,
     )
+

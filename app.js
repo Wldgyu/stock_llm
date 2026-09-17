@@ -10,6 +10,7 @@ const state = {
   interval: "1d",
   priceChart: null,
   rsiChart: null,
+  macdChart: null,
   eventSource: null,
   candleTimer: null,
   requestId: 0,
@@ -37,6 +38,10 @@ function formatPrice(value, currency = state.currency) {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   })}`;
+}
+
+function isNumber(value) {
+  return value != null && value !== "" && Number.isFinite(Number(value));
 }
 
 function formatNumber(value, decimals = 2) {
@@ -126,8 +131,6 @@ function renderStockCard(stock, index) {
   const changeText = stock.pct == null ? "시세 대기" : `${change >= 0 ? "+" : ""}${change.toFixed(2)}%`;
   const rsi = Number(stock.rsi);
   const rsiColor = stock.rsi == null ? "#8892a4" : rsi > 70 ? "#ff4d6d" : rsi < 30 ? "#00e5a0" : "#f5c518";
-  const sentiment = Number(stock.sentiment);
-  const sentimentColor = stock.sentiment == null ? "#8892a4" : sentiment > 0 ? "#00e5a0" : sentiment < 0 ? "#ff4d6d" : "#f5c518";
   const finalScore = stock.final_score == null ? "—" : `${Number(stock.final_score) >= 0 ? "+" : ""}${Number(stock.final_score).toFixed(2)}`;
 
   return `
@@ -149,10 +152,6 @@ function renderStockCard(stock, index) {
         <div class="metric-item">
           <span class="metric-label">RSI</span>
           <strong class="metric-value" style="color:${rsiColor}">${formatNumber(stock.rsi, 1)}</strong>
-        </div>
-        <div class="metric-item">
-          <span class="metric-label">감성</span>
-          <strong class="metric-value" style="color:${sentimentColor}">${formatNumber(stock.sentiment, 2)}</strong>
         </div>
         <div class="metric-item">
           <span class="metric-label">AI 점수</span>
@@ -316,9 +315,7 @@ function analysisKpi(label, value, subtext, color = "var(--text-primary)") {
 function renderAnalysis(data) {
   const latest = data.latest || {};
   const rsi = Number(latest.rsi);
-  const sentiment = Number(latest.sentiment);
   const risk = Number(latest.risk_score);
-  const isNumber = (value) => value != null && value !== "" && Number.isFinite(Number(value));
   const isPositive = (value) => isNumber(value) && Number(value) > 0;
   const cards = [];
 
@@ -330,9 +327,6 @@ function renderAnalysis(data) {
   }
   if (isPositive(latest.resistance)) {
     cards.push(analysisKpi("저항선", formatPrice(latest.resistance, data.currency), "최근 20일 고가", "#ff4d6d"));
-  }
-  if (isNumber(latest.sentiment)) {
-    cards.push(analysisKpi("감성점수", formatNumber(latest.sentiment, 2), "뉴스 감성", sentiment > 0 ? "#00e5a0" : sentiment < 0 ? "#ff4d6d" : "#f5c518"));
   }
   if (isPositive(latest.usd_krw)) {
     cards.push(analysisKpi("USD/KRW", formatNumber(latest.usd_krw, 1), "환율", "#00d4ff"));
@@ -352,62 +346,110 @@ function renderAnalysis(data) {
     ? ""
     : `최근 분석 종가 ${formatPrice(latest.last_close, data.currency)} · ${latest.timestamp?.slice(0, 16) || ""}`;
   $("analysis-message").textContent = cards.length ? (data.message || "") : "";
-  renderPredictions(latest, data.currency);
+  renderPredictions(latest, data.currency, data.model_validation);
 }
 
-function renderPredictions(latest, currency) {
-  const low = latest.pred_low;
-  const high = latest.pred_high;
-  const lstmValues = [latest.lstm_t1, latest.lstm_t4, latest.lstm_t7];
-  const tabpfnValues = [latest.tabpfn_t1, latest.tabpfn_t4, latest.tabpfn_t7];
-  const hasRange = low != null && high != null;
-  const hasLstmDetails = lstmValues.some((value) => value != null);
-  const hasTabpfnDetails = tabpfnValues.some((value) => value != null);
-
-  if (!hasRange && !hasLstmDetails && !hasTabpfnDetails) {
-    $("prediction-section").hidden = true;
-    $("prediction-cards").innerHTML = "";
-    $("model-prediction-details").innerHTML = "";
-    return;
-  }
-  $("prediction-section").hidden = false;
-  const middle = hasRange ? (Number(low) + Number(high)) / 2 : null;
-  $("prediction-cards").innerHTML = hasRange ? `
-    <div class="prediction-card">
-      <span class="pred-day">LSTM 예측 하단</span>
-      <strong class="pred-price down">${formatPrice(low, currency)}</strong>
-      <span class="pred-range">T+1 · T+4 · T+7 최솟값</span>
-    </div>
-    <div class="prediction-card">
-      <span class="pred-day">LSTM 예측 중앙</span>
-      <strong class="pred-price">${formatPrice(middle, currency)}</strong>
-      <span class="pred-range">예측 범위 중앙값</span>
-    </div>
-    <div class="prediction-card">
-      <span class="pred-day">LSTM 예측 상단</span>
-      <strong class="pred-price up">${formatPrice(high, currency)}</strong>
-      <span class="pred-range">T+1 · T+4 · T+7 최댓값</span>
-    </div>` : "";
-
-  const renderModelRow = (label, values, className) => `
+function renderPredictions(latest, currency, validationPayload = {}) {
+  const models = [
+    ["LSTM", [latest.lstm_t1, latest.lstm_t4, latest.lstm_t7], "lstm-model-row"],
+    ["TabPFN", [latest.tabpfn_t1, latest.tabpfn_t4, latest.tabpfn_t7], "tabpfn-model-row"],
+  ];
+  const hasPrices = models.some(([,values]) => values.some(isNumber));
+  const hasValidation = Object.keys(validationPayload.models || {}).length > 0;
+  $("prediction-section").hidden = !hasPrices && !hasValidation;
+  const base = isNumber(latest.last_close) && Number(latest.last_close) > 0 ? Number(latest.last_close) : null;
+  $("prediction-context").textContent = base == null
+    ? "T+1 · T+4 · T+7은 마지막 확정 일봉 이후 거래일 기준입니다."
+    : `분석 기준 종가 ${formatPrice(base, currency)} (${latest.data_date || "기준일 미기록"}) · 저장 시각 ${latest.timestamp || "—"} · 예상 등락률은 분석 기준 종가 대비입니다.`;
+  $("model-prediction-details").innerHTML = hasPrices ? models.map(([label, values, className]) => `
     <div class="model-prediction-row ${className}">
       <strong class="model-prediction-name">${label}</strong>
-      ${values.map((value, index) => `
-        <span class="model-prediction-item">
-          <small>${["1일 뒤", "4일 뒤", "7일 뒤"][index]}</small>
-          <b>${formatPrice(value, currency)}</b>
-        </span>
-      `).join("")}
-    </div>`;
+      ${values.map((value, index) => {
+        const change = isNumber(value) && base != null ? (Number(value) / base - 1) * 100 : null;
+        return `<span class="model-prediction-item">
+          <small>${["T+1", "T+4", "T+7"][index]} · ${escapeHtml(latest[["target_t1", "target_t4", "target_t7"][index]] || "목표일 미기록")}</small>
+          <b>${isNumber(value) ? formatPrice(value, currency) : "분석 결과 없음"}</b>
+          <small class="prediction-change" style="color:${change == null ? "#8892a4" : change > 0 ? "#00e5a0" : change < 0 ? "#ff4d6d" : "#8892a4"}">${change == null ? "" : `${change > 0 ? "+" : ""}${change.toFixed(2)}%`}</small>
+        </span>`;
+      }).join("")}
+    </div>`).join("") : "<p>저장된 모델 예측가가 없습니다.</p>";
+  renderModelValidation(validationPayload, currency);
+}
 
-  const detailRows = [];
-  if (hasLstmDetails) {
-    detailRows.push(renderModelRow("LSTM", lstmValues, "lstm-model-row"));
+function renderModelValidation(payload, currency) {
+  const models = payload?.models || {};
+  const container = $("model-validation-results");
+  const modelEntries = [
+    ["lstm", "LSTM"],
+    ["tabpfn", "TabPFN"],
+  ].filter(([key]) => models[key]);
+
+  if (!modelEntries.length) {
+    container.innerHTML = "";
+    return;
   }
-  if (hasTabpfnDetails) {
-    detailRows.push(renderModelRow("TabPFN", tabpfnValues, "tabpfn-model-row"));
-  }
-  $("model-prediction-details").innerHTML = detailRows.join("");
+
+  const formatPercent = (value) =>
+    isNumber(value) ? `${formatNumber(value, 2)}%` : "—";
+  const formatSignedPercent = (value) => {
+    if (!isNumber(value)) return "—";
+    const number = Number(value);
+    return `${number >= 0 ? "+" : ""}${number.toFixed(2)}%`;
+  };
+  const foldValue = (summary, metric, isPercent = false) => {
+    const value = summary?.[metric];
+    if (!value) return "—";
+    const mean = isPercent
+      ? formatNumber(value.mean, 2)
+      : formatPrice(value.mean, currency);
+    const std = isPercent
+      ? formatNumber(value.std, 2)
+      : formatPrice(value.std, currency);
+    return `${mean} ± ${std}${isPercent ? "%" : ""}`;
+  };
+
+  container.innerHTML = `
+    <h4 class="validation-title">모델 검증 결과</h4>
+    <div class="validation-grid">
+      ${modelEntries.map(([key, label]) => {
+        const metrics = models[key] || {};
+        const test = metrics.test || {};
+        const naive = metrics.naive_baseline || {};
+        const comparison = metrics.comparison || {};
+        const fold = metrics.fold_summary?.model || {};
+        const warning = metrics.baseline_warning;
+        return `
+          <article class="validation-card ${warning ? "warning" : "passed"}">
+            <div class="validation-card-header">
+              <strong>${label}</strong>
+              <span>${warning ? "기준 미달" : "naive 통과"}</span>
+            </div>
+            ${warning ? `<p class="validation-warning">⚠️ ${escapeHtml(warning)}</p>` : ""}
+            <div class="validation-metrics">
+              <span><small>MAE</small><b>${formatPrice(test.mae, currency)}</b></span>
+              <span><small>RMSE</small><b>${formatPrice(test.rmse, currency)}</b></span>
+              <span><small>MAPE</small><b>${formatPercent(test.mape)}</b></span>
+              <span><small>방향 정확도</small><b>${formatPercent(test.direction_accuracy)}</b></span>
+              <span><small>naive 대비 MAE</small><b>${formatSignedPercent(comparison.mae_improvement_pct)}</b></span>
+              <span><small>naive MAE</small><b>${formatPrice(naive.mae, currency)}</b></span>
+            </div>
+            ${metrics.strategy_backtest ? `
+              <div class="fold-summary">
+                <strong>동일 기간 전략 백테스트 · 비용 차감</strong>
+                <span>${escapeHtml(metrics.strategy_backtest.start)} ~ ${escapeHtml(metrics.strategy_backtest.end)}</span>
+                <span>T+1 · 다음 시가 체결 · 매수/현금 · 편도 수수료 ${formatNumber(metrics.strategy_backtest.fee_bps_per_side, 0)}bp + 슬리피지 ${formatNumber(metrics.strategy_backtest.slippage_bps_per_side, 0)}bp · 세금 제외</span>
+                ${Object.entries(metrics.strategy_backtest.strategies).map(([name, result]) => `<span>${escapeHtml(name)}: 수익률 ${formatSignedPercent(result.return_pct)} · Sharpe ${formatNumber(result.sharpe, 2)} · MDD ${formatPercent(result.mdd_pct)} · 주문 ${result.orders}회</span>`).join("")}
+              </div>` : ""}
+            <div class="fold-summary">
+              <strong>3-fold 평균 ± 표준편차</strong>
+              <span>MAE ${foldValue(fold, "mae")}</span>
+              <span>RMSE ${foldValue(fold, "rmse")}</span>
+              <span>MAPE ${foldValue(fold, "mape", true)}</span>
+              <span>방향 ${foldValue(fold, "direction_accuracy", true)}</span>
+            </div>
+          </article>`;
+      }).join("")}
+    </div>`;
 }
 
 function resetDetail() {
@@ -417,8 +459,10 @@ function resetDetail() {
     '<div class="kpi-card"><div class="skeleton kpi-skeleton"></div></div>'
   ).join("");
   $("live-kpis").innerHTML = "";
-  $("prediction-cards").innerHTML = '<div class="skeleton prediction-skeleton"></div>';
+  $("prediction-context").textContent = "분석 결과 불러오는 중…";
+  $("t1-realized-results").innerHTML = "";
   $("model-prediction-details").innerHTML = "";
+  $("model-validation-results").innerHTML = "";
   $("analysis-message").textContent = "";
   $("analysis-close").textContent = "";
   setChartLoading(true);
@@ -455,6 +499,7 @@ async function openDetail(stock) {
       state.currentSymbol = data.symbol || state.currentSymbol;
       state.currency = data.currency || state.currency;
       renderAnalysis(data);
+      loadT1History(stock.name, requestId, data.currency);
     } catch (error) {
       if (requestId === state.requestId) {
         $("analysis-message").textContent = error.message;
@@ -526,6 +571,8 @@ async function loadCandles(requestId = state.requestId, showLoading = true) {
 function destroyCharts() {
   state.priceChart?.destroy();
   state.rsiChart?.destroy();
+  state.macdChart?.destroy();
+  state.macdChart = null;
   state.priceChart = null;
   state.rsiChart = null;
 }
@@ -625,6 +672,20 @@ function renderLiveCharts(candles) {
         ctx.restore();
       },
     }],
+  });
+  state.macdChart = new Chart($("live-macd-chart").getContext("2d"), {
+    type: "bar",
+    data: { labels, datasets: [
+      {label:"OSC (MACD − SIGNAL)", data:values("macd_osc"), backgroundColor:values("macd_osc").map(v => v == null ? "transparent" : v >= 0 ? "rgba(0,229,160,.65)" : "rgba(255,77,109,.65)"), order:2},
+      {type:"line", label:"MACD (12, 26)", data:values("macd"), borderColor:"#4f8ef7", borderWidth:1.5, pointRadius:0, order:1},
+      {type:"line", label:"SIGNAL (9)", data:values("macd_signal"), borderColor:"#f5c518", borderWidth:1.5, pointRadius:0, order:1}
+    ]},
+    options: {
+      responsive:true, maintainAspectRatio:false, animation:false,
+      interaction:{mode:"index",intersect:false},
+      plugins:{legend:{labels:{color:CHART_COLORS.tick,boxWidth:12}},tooltip:{callbacks:{label:c=>`${c.dataset.label}: ${formatNumber(c.parsed.y,4)}`}}},
+      scales:{x:{ticks:{color:CHART_COLORS.tick,maxTicksLimit:9,maxRotation:0},grid:{color:CHART_COLORS.grid}},y:{position:"right",ticks:{color:CHART_COLORS.tick},grid:{color:c=>c.tick.value===0 ? "rgba(255,255,255,.4)" : CHART_COLORS.grid}}}
+    }
   });
 }
 
@@ -736,3 +797,22 @@ window.addEventListener("beforeunload", () => {
   state.eventSource?.close();
   clearInterval(state.candleTimer);
 });
+
+
+async function loadT1History(name, requestId, currency) {
+  const container = $("t1-realized-results");
+  container.textContent = "T+1 실제 종가 확인 중…";
+  try {
+    const data = await fetchJson(`${API}/api/stock/${encodeURIComponent(name)}/t1-history`);
+    if (requestId !== state.requestId) return;
+    const labels = {complete:"평가 완료",pending:"장 마감 대기",awaiting_data:"종가 제공 대기",fetch_failed:"종가 조회 실패 · 다시 열어 재시도",late:"개장 이후 저장 · 평가 제외",untracked:"과거 기록 · 목표일 없음",invalid_date:"목표일 확인 필요"};
+    const rows = data.history || [];
+    container.innerHTML = `<h4>T+1 예측과 이후 실제 종가</h4><p>최근 분석 30건 · 목표일 개장 전에 저장한 예측만 평가합니다. 오차는 예측가 − 실제 종가입니다. 실제 종가는 예측 당시 조정 가격 기준으로 환산합니다.</p>
+      <div class="t1-table-scroll"><table class="t1-history-table"><thead><tr><th>저장 시각</th><th>목표일</th><th>모델</th><th>예측가</th><th>실제 종가</th><th>오차 / 오차율</th><th>방향</th><th>상태</th></tr></thead><tbody>${rows.map(row => Object.entries(row.models).map(([key,m])=>`<tr>
+      <td>${escapeHtml(row.saved_at)}</td><td>${escapeHtml(row.target_date || "—")}</td><td>${key === "lstm" ? "LSTM" : "TabPFN"}</td>
+      <td>${formatPrice(m.prediction,currency)}</td><td>${formatPrice(row.actual,currency)}</td><td>${m.error == null ? "—" : `${formatPrice(m.error,currency)} / ${formatNumber(m.error_pct)}%`}</td>
+      <td>${m.direction_correct == null ? "—" : m.direction_correct ? "적중" : "불일치"}</td><td>${m.prediction == null ? "예측 없음" : escapeHtml(labels[row.status] || row.status)}</td></tr>`).join("")).join("")}</tbody></table></div>${rows.length ? "" : "<p>저장된 예측 기록이 없습니다.</p>"}`;
+  } catch (error) {
+    if (requestId === state.requestId) container.textContent = `T+1 비교 조회 실패: ${error.message}`;
+  }
+}

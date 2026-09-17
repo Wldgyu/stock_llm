@@ -4,7 +4,7 @@ ml_stock.py
 ───────────────────────────────────────────────────────────────────
 [역할] 머신러닝 학습 및 분석 엔진
   - LSTMModel       : PyTorch 기반 LSTM 가격 예측 모델
-  - StockAIAgentV3  : 데이터 수집 / 감성분석 / 백테스트 / 예측 / 시각화
+  - StockAIAgentV3  : 데이터 수집 / 뉴스 수집 / 백테스트 / 예측 / 시각화
   - run_and_return(): llm_stock.py 에서 import 하여 결과를 딕셔너리로 받음
 
 [단독 실행 시] python ml_stock.py
@@ -17,6 +17,7 @@ import warnings
 import traceback
 import urllib.parse
 import os
+import json
 from pathlib import Path
 
 import numpy as np
@@ -24,7 +25,6 @@ import pandas as pd
 import pandas_ta as ta
 import yfinance as yf
 import feedparser
-import matplotlib.pyplot as plt
 
 try:
     import trafilatura
@@ -39,9 +39,11 @@ import torch
 import torch.nn as nn
 from dotenv import load_dotenv
 from sklearn.preprocessing import StandardScaler
-from transformers import pipeline
 
 from database import DB_PATH, connect_db
+from backtesting import compare_strategies
+from trading_dates import prediction_dates, completed_bars
+from news_selection import COMPANIES, select_news
 
 # ── TabPFN / HuggingFace 인증 자동 로드 ──────────────────────
 load_dotenv(Path(__file__).with_name(".env"))
@@ -101,27 +103,6 @@ warnings.filterwarnings('ignore')
 # ──────────────────────────────────────────────
 # 공통 유틸: 다음 거래일 계산
 # ──────────────────────────────────────────────
-def get_next_trading_date():
-    """오늘 요일을 기준으로 다음 거래일(날짜, 상태 메시지)을 반환합니다."""
-    today = datetime.now()
-    weekday = today.weekday()  # 0:월 ~ 6:일
-
-    if weekday == 4:   # 금요일 → 다음 월요일
-        next_date = today + timedelta(days=3)
-        status = "💤 주말 휴장 전 (월요일 예측)"
-    elif weekday == 5: # 토요일 → 다음 월요일
-        next_date = today + timedelta(days=2)
-        status = "🏖️ 주말 휴장 중 (월요일 예측)"
-    elif weekday == 6: # 일요일 → 다음 월요일
-        next_date = today + timedelta(days=1)
-        status = "🌙 휴장 마지막 날 (내일 예측)"
-    else:              # 평일 → 내일
-        next_date = today + timedelta(days=1)
-        status = "🔔 시장 가동 중 (내일 예측)"
-
-    return next_date.strftime('%Y-%m-%d'), status
-
-
 # ──────────────────────────────────────────────
 # 1. LSTM 모델 정의
 # ──────────────────────────────────────────────
@@ -168,12 +149,19 @@ class StockAIAgentV3:
 
     기능:
       - 주가 + 매크로(환율·SOX) 데이터 수집
-      - FinBERT / KoELECTRA 뉴스 감성 분석
+      - LLM용 뉴스 제목 및 본문 수집
       - RSI 기반 백테스트
       - Sharpe Ratio / MDD 성과 지표
       - LSTM 3-step 가격 예측 (T+1, T+4, T+7)
-      - Integrated Gradients 피처 기여도 시각화
     """
+
+    # 기본 학습 범위와 LSTM 크기를 한곳에서 조정합니다.
+    HISTORY_PERIOD = "3y"
+    LSTM_SEQUENCE_LENGTH = 30
+    LSTM_HIDDEN_SIZE = 32
+    LSTM_NUM_LAYERS = 1
+    LSTM_MAX_EPOCHS = 100
+    WALK_FORWARD_FOLDS = 3
 
     def __init__(self):
         self.tickers = {
@@ -188,19 +176,6 @@ class StockAIAgentV3:
         self.db_path = DB_PATH
         self._init_analysis_db()
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-        # 영문 감성 분석 모델 (FinBERT)
-        self.en_pipe = pipeline(
-            "sentiment-analysis",
-            model="ProsusAI/finbert",
-            device=self.device
-        )
-        # 한국어 감성 분석 모델 (KoELECTRA)
-        self.ko_pipe = pipeline(
-            "sentiment-analysis",
-            model="daekeun-ml/koelectra-small-v3-nsmc",
-            device=self.device
-        )
 
     def _init_analysis_db(self):
         """웹 대시보드가 읽는 ML 분석 이력 테이블을 준비합니다."""
@@ -229,19 +204,35 @@ class StockAIAgentV3:
                     tabpfn_t1   REAL,
                     tabpfn_t4   REAL,
                     tabpfn_t7   REAL,
+                    lstm_metrics_json   TEXT,
+                    tabpfn_metrics_json TEXT,
                     risk_score  INTEGER
                 )
             """)
             columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(analysis_log)")
             }
-            # 기존 DB에도 모델별 개별 예측 컬럼을 자동으로 추가합니다.
-            for column in (
-                "lstm_t1", "lstm_t4", "lstm_t7",
-                "tabpfn_t1", "tabpfn_t4", "tabpfn_t7",
-            ):
+            # 기존 DB에도 모델별 예측과 검증 결과 컬럼을 자동으로 추가합니다.
+            new_columns = {
+                "data_date": "TEXT",
+                "target_t1": "TEXT",
+                "target_t4": "TEXT",
+                "target_t7": "TEXT",
+                "lstm_t1": "REAL",
+                "lstm_t4": "REAL",
+                "lstm_t7": "REAL",
+                "tabpfn_t1": "REAL",
+                "tabpfn_t4": "REAL",
+                "tabpfn_t7": "REAL",
+                "lstm_metrics_json": "TEXT",
+                "tabpfn_metrics_json": "TEXT",
+            }
+            for column, column_type in new_columns.items():
                 if column not in columns:
-                    conn.execute(f"ALTER TABLE analysis_log ADD COLUMN {column} REAL")
+                    conn.execute(
+                        f"ALTER TABLE analysis_log "
+                        f"ADD COLUMN {column} {column_type}"
+                    )
             conn.commit()
         finally:
             conn.close()
@@ -251,8 +242,6 @@ class StockAIAgentV3:
         df = result["df"]
         rsi = float(df["RSI"].dropna().iloc[-1])
         trend = "과매수" if rsi > 70 else ("과매도" if rsi < 30 else "중립")
-        sentiment = float(result["sentiment"])
-        sent_label = "긍정" if sentiment > 0.05 else ("부정" if sentiment < -0.05 else "중립")
         predictions = [float(value) for value in result["preds"]]
         tabpfn_predictions = result.get("tabpfn_preds") or [None, None, None]
         tabpfn_predictions = [
@@ -274,8 +263,8 @@ class StockAIAgentV3:
             float(recent["High"].max()),
             float(df["USD_KRW"].iloc[-1]),
             float(df["SOX_Index"].iloc[-1]),
-            sentiment,
-            sent_label,
+            None,
+            None,
             min(predictions),
             max(predictions),
             predictions[0],
@@ -284,23 +273,30 @@ class StockAIAgentV3:
             tabpfn_predictions[0],
             tabpfn_predictions[1],
             tabpfn_predictions[2],
+            json.dumps(result["lstm_metrics"], ensure_ascii=False),
+            json.dumps(result.get("tabpfn_metrics"), ensure_ascii=False)
+            if result.get("tabpfn_metrics") is not None else None,
             risk_score,
+            result["data_date"], result["target_t1"], result["target_t4"], result["target_t7"],
         )
         conn = connect_db(self.db_path)
         try:
-            conn.execute("""
+            cursor = conn.execute("""
                 INSERT INTO analysis_log (
                     timestamp, name, symbol, last_close, rsi, trend,
                     support, resistance, usd_krw, sox, sentiment,
                     sent_label, pred_low, pred_high,
                     lstm_t1, lstm_t4, lstm_t7,
-                    tabpfn_t1, tabpfn_t4, tabpfn_t7, risk_score
+                    tabpfn_t1, tabpfn_t4, tabpfn_t7,
+                    lstm_metrics_json, tabpfn_metrics_json, risk_score,
+                    data_date, target_t1, target_t4, target_t7
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
             """, values)
             conn.commit()
+            result["analysis_id"] = cursor.lastrowid
         finally:
             conn.close()
 
@@ -312,20 +308,34 @@ class StockAIAgentV3:
             return None
 
         df["RSI"] = ta.rsi(df["Close"], length=14)
+        print(f"📅 [{name}] 최신 확정 일봉: {df.index[-1].date()} | 수집 {len(df)}거래일")
         bt_ret, equity = self.backtest(df)
         sharpe, mdd    = self.calculate_performance_metrics(equity)
-        sentiment, titles = self.get_realtime_sentiment(name)
+        titles = self.get_news_titles(name)
         news_articles = self.get_financial_news_articles(name, symbol)
         preds, model, last_seq, baseline_seq, lstm_metrics = self.predict_multi_step(df)
         tabpfn_preds, tabpfn_metrics = self.predict_tabpfn(df)
+        model_metrics = {"lstm": lstm_metrics}
+        if tabpfn_metrics:
+            model_metrics["tabpfn"] = tabpfn_metrics
+        comparison = compare_strategies(
+            df, {key: value["oos_t1_predictions"] for key, value in model_metrics.items()}
+        )
+        comparison["data_date"] = str(df.index[-1].date())
+        for value in model_metrics.values():
+            value["strategy_backtest"] = comparison
+        print(f"📊 OOS 전략 비교 {comparison['start']} ~ {comparison['end']} (비용 차감)")
+        print("   ℹ️ T+1·T+4·T+7 정답이 모두 있는 공통 OOS 표본 기준: 최근 6거래일은 제외됩니다. 최신 예측 기준일과 다릅니다.")
+        for key, value in comparison["strategies"].items():
+            print(f"  {key}: 수익률 {value['return_pct']:.2f}% | Sharpe {value['sharpe']:.2f} | MDD {value['mdd_pct']:.2f}% | 주문 {value['orders']}회")
 
         result = {
+            **prediction_dates(df.index[-1], symbol),
             "df": df,
             "symbol": symbol,
             "bt_ret": bt_ret,
             "sharpe": sharpe,
             "mdd": mdd,
-            "sentiment": sentiment,
             "titles": titles,
             "news_articles": news_articles,
             "preds": preds,
@@ -344,38 +354,82 @@ class StockAIAgentV3:
     @staticmethod
     def _drop_incomplete_daily_bar(df: pd.DataFrame, symbol: str):
         """거래소 정규장이 끝나기 전 생성된 당일 미완성 일봉을 제거합니다."""
-        if df.empty:
-            return df
-
-        is_korean = symbol.endswith((".KS", ".KQ"))
-        timezone = ZoneInfo("Asia/Seoul" if is_korean else "America/New_York")
-        market_close = clock_time(15, 30) if is_korean else clock_time(16, 0)
-        market_now = datetime.now(timezone)
-        latest_date = pd.Timestamp(df.index[-1]).date()
-
-        # 오늘 날짜의 행은 정규장 종료 전에는 종가가 확정되지 않았으므로 제외합니다.
-        local_time = market_now.time().replace(tzinfo=None)
-        if latest_date == market_now.date() and local_time < market_close:
-            print(
-                f"      ℹ️ {symbol} 미완성 당일 일봉({latest_date})을 제외합니다."
-            )
-            return df.iloc[:-1].copy()
-        return df
+        return completed_bars(df, symbol)
 
     @staticmethod
-    def _macro_lags_for_symbol(symbol: str) -> dict:
-        """각 시장 마감 시점에 실제로 확정된 거시지표의 지연일을 반환합니다."""
-        is_korean = symbol.endswith((".KS", ".KQ"))
-        return {
-            "USD_KRW": 1,
-            "SOX_Index": 1 if is_korean else 0,
+    def _close_times_utc(index, timezone_name: str, close_time: clock_time):
+        """일봉 날짜와 시장 마감 시각을 결합해 UTC 확정 시각으로 변환합니다."""
+        timezone = ZoneInfo(timezone_name)
+        utc = ZoneInfo("UTC")
+        close_timestamps = []
+        for value in index:
+            timestamp = pd.Timestamp(value)
+            if timestamp.tzinfo is not None:
+                timestamp = timestamp.tz_convert(timezone)
+            local_close = datetime.combine(
+                timestamp.date(), close_time, tzinfo=timezone
+            )
+            close_timestamps.append(local_close.astimezone(utc))
+        return pd.to_datetime(close_timestamps, utc=True)
+
+    @classmethod
+    def _merge_confirmed_macro(
+        cls,
+        stock_df: pd.DataFrame,
+        macro_series: pd.Series,
+        stock_symbol: str,
+        macro_name: str,
+    ) -> pd.Series:
+        """주가 마감 전에 확정된 가장 최신 거시지표만 결합합니다."""
+        is_korean = stock_symbol.endswith((".KS", ".KQ"))
+        stock_timezone = "Asia/Seoul" if is_korean else "America/New_York"
+        stock_close = clock_time(15, 30) if is_korean else clock_time(16, 0)
+        macro_rules = {
+            "USD_KRW": ("America/New_York", clock_time(17, 0)),
+            "SOX_Index": ("America/New_York", clock_time(16, 0)),
         }
+        macro_timezone, macro_close = macro_rules[macro_name]
+
+        stock_times = cls._close_times_utc(
+            stock_df.index, stock_timezone, stock_close
+        )
+        macro_times = cls._close_times_utc(
+            macro_series.index, macro_timezone, macro_close
+        )
+        left = pd.DataFrame({
+            "_stock_row": np.arange(len(stock_df)),
+            "_confirmed_at": stock_times,
+        }).sort_values("_confirmed_at")
+        right = pd.DataFrame({
+            "_confirmed_at": macro_times,
+            macro_name: pd.to_numeric(macro_series, errors="coerce").to_numpy(),
+        })
+        right = (
+            right.dropna(subset=[macro_name])
+            .drop_duplicates("_confirmed_at", keep="last")
+            .sort_values("_confirmed_at")
+        )
+        if right.empty:
+            return pd.Series(np.nan, index=stock_df.index, name=macro_name)
+
+        merged = pd.merge_asof(
+            left,
+            right,
+            on="_confirmed_at",
+            direction="backward",
+            allow_exact_matches=True,
+        )
+        values = (
+            merged.sort_values("_stock_row")[macro_name]
+            .to_numpy(dtype=np.float64)
+        )
+        return pd.Series(values, index=stock_df.index, name=macro_name)
 
     def fetch_data(self, symbol: str):
-        """yfinance로 1년치 일봉 + 환율(KRW=X) + SOX 지수를 다운로드합니다."""
+        """yfinance로 3년치 일봉 + 환율(KRW=X) + SOX 지수를 다운로드합니다."""
         df = yf.download(
             symbol,
-            period="1y",
+            period=self.HISTORY_PERIOD,
             interval="1d",
             auto_adjust=True,
             progress=False,
@@ -392,81 +446,43 @@ class StockAIAgentV3:
 
         # 매크로 데이터 병합
         macros = {"USD_KRW": "KRW=X", "SOX_Index": "^SOX"}
-        # 한국장은 미국장·FX 일봉보다 먼저 닫히므로 둘 다 전 거래일 값을 사용합니다.
-        # 미국장은 SOX와 동시에 닫혀 SOX 당일값은 사용하고, 늦게 마감되는 FX만 지연합니다.
-        macro_lags = self._macro_lags_for_symbol(symbol)
         for col_name, m_sym in macros.items():
             m_data = yf.download(
                 m_sym,
-                period="1y",
+                period=self.HISTORY_PERIOD,
                 interval="1d",
                 auto_adjust=True,
                 progress=False,
             )['Close']
             if isinstance(m_data, pd.DataFrame):
                 m_data = m_data.iloc[:, 0]
-            lag = macro_lags[col_name]
-            if lag:
-                # 값의 행을 미는 대신 사용 가능 날짜를 옮겨 서로 다른 시장 휴장일도 처리합니다.
-                m_data.index = m_data.index + pd.Timedelta(days=lag)
-            df[col_name] = m_data
+            # UTC 확정 시각을 기준으로 직전 사용 가능 값만 가져와 미래 누수를 막습니다.
+            df[col_name] = self._merge_confirmed_macro(
+                df, m_data, symbol, col_name
+            )
 
         # 과거 값으로만 채워 미래 데이터가 과거 행에 들어가는 누수를 막습니다.
         df = df.ffill().dropna()
         return df
 
-    # ── 뉴스 감성 분석 ────────────────────────
-    @staticmethod
-    def _normalize_sentiment_score(label: str, confidence: float) -> float:
-        """모델 라벨을 부정(-), 중립(0), 긍정(+) 점수로 변환합니다."""
-        normalized_label = str(label).upper()
-        if normalized_label in {"NEGATIVE", "LABEL_0"}:
-            return -float(confidence)
-        if normalized_label == "NEUTRAL":
-            return 0.0
-        if normalized_label in {"POSITIVE", "LABEL_1"}:
-            return float(confidence)
-        return 0.0
-
-    def get_realtime_sentiment(self, name: str):
-        """Google News RSS에서 헤드라인을 수집하고 감성 점수를 반환합니다."""
-        encoded_query = urllib.parse.quote(name)
-        is_ko = any(ord(c) > 127 for c in name)
-        locale = 'ko&gl=KR&ceid=KR:ko' if is_ko else 'en-US&gl=US&ceid=US:en'
-        url = f"https://news.google.com/rss/search?q={encoded_query}&hl={locale}"
+    # ── 뉴스 제목 수집 ────────────────────────
+    def get_news_titles(self, name: str):
+        """기사 본문을 얻지 못했을 때 LLM에 전달할 뉴스 제목을 수집합니다."""
+        company = COMPANIES.get(name, (name, ()))[0]
+        encoded_query = urllib.parse.quote(f'{company} when:14d')
+        url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-US&gl=US&ceid=US:en"
         rss = feedparser.parse(url)
-        titles = [e.title for e in rss.entries[:5]]
-        pipe = self.ko_pipe if is_ko else self.en_pipe
-
-        scores = []
-        for t in titles:
-            try:
-                res = pipe(t[:512])[0]
-                scores.append(
-                    self._normalize_sentiment_score(
-                        res.get("label", ""), res.get("score", 0.0)
-                    )
-                )
-            except Exception:
-                continue
-
-        avg_score = sum(scores) / len(scores) if scores else 0.0
-        return avg_score, titles
+        return [entry.title for entry, _, _ in select_news(rss.entries, name, limit=3)]
 
     def get_financial_news_articles(self, name: str, symbol: str):
-        """지정 금융 언론사별 최신 기사 한 건의 접근 가능한 본문을 수집합니다."""
+        """지정 금융 언론사별 최근 14일의 주가 관련 기사를 선별해 본문을 수집합니다."""
         sources = {
             "Bloomberg": ("Bloomberg",),
             "Wall Street Journal": ("WSJ", "The Wall Street Journal", "Wall Street Journal"),
             "Financial Times": ("Financial Times",),
             "Reuters": ("Reuters",),
         }
-        query_names = {
-            "삼성전자": "Samsung Electronics",
-            "엔비디아": "NVIDIA",
-            "인텔": "Intel",
-        }
-        company_query = query_names.get(name, symbol.split(".")[0])
+        company_query = COMPANIES.get(name, (symbol.split(".")[0], ()))[0]
         articles = []
 
         for display_source, accepted_names in sources.items():
@@ -479,17 +495,11 @@ class StockAIAgentV3:
                 f"?q={encoded_query}&hl=en-US&gl=US&ceid=US:en"
             )
             rss = feedparser.parse(url)
-            entry = next(
-                (
-                    item
-                    for item in rss.entries
-                    if getattr(getattr(item, "source", {}), "title", "")
-                    in accepted_names
-                ),
-                None,
-            )
-            if entry is None:
+            selected = select_news(rss.entries, name, accepted_names)
+            if not selected:
                 continue
+            entry, relevance_score, reasons = selected[0]
+            print(f"      📰 {display_source}: {entry.title} (선정: {', '.join(reasons)})")
 
             article_url = entry.link
             body = ""
@@ -524,6 +534,8 @@ class StockAIAgentV3:
             articles.append(
                 {
                     "source": display_source,
+                    "selection_reason": reasons,
+                    "relevance_score": relevance_score,
                     "title": entry.title,
                     "published": getattr(entry, "published", ""),
                     "url": article_url,
@@ -594,32 +606,149 @@ class StockAIAgentV3:
 
     # ── 모델 검증 공통 함수 ────────────────────
     @staticmethod
-    def _regression_metrics(y_true, y_pred):
-        """실제값과 예측값의 평균 오차를 계산합니다."""
+    def _regression_metrics(y_true, y_pred, reference_values=None):
+        """가격 오차와 기준 가격 대비 상승·하락 방향 정확도를 계산합니다."""
         y_true = np.asarray(y_true, dtype=np.float64)
         y_pred = np.asarray(y_pred, dtype=np.float64)
+        reference = None
+        if reference_values is not None:
+            reference = np.asarray(reference_values, dtype=np.float64)
+            if reference.ndim == 1 and y_true.ndim == 2:
+                reference = np.repeat(reference[:, None], y_true.shape[1], axis=1)
+            reference = np.broadcast_to(reference, y_true.shape)
 
-        def calculate(actual, predicted):
+        def calculate(actual, predicted, base=None):
             error = predicted - actual
             safe_actual = np.where(np.abs(actual) < 1e-8, 1e-8, np.abs(actual))
-            return {
+            result = {
                 "mae": float(np.mean(np.abs(error))),
                 "rmse": float(np.sqrt(np.mean(error ** 2))),
                 "mape": float(np.mean(np.abs(error) / safe_actual) * 100),
             }
+            if base is not None:
+                actual_direction = np.sign(actual - base)
+                predicted_direction = np.sign(predicted - base)
+                result["direction_accuracy"] = float(
+                    np.mean(actual_direction == predicted_direction) * 100
+                )
+            return result
 
-        result = calculate(y_true, y_pred)
+        result = calculate(y_true, y_pred, reference)
         if y_true.ndim == 2 and y_true.shape[1] == 3:
             # 각 예측 시점의 성능도 따로 확인할 수 있게 보관합니다.
             result["by_horizon"] = {
-                label: calculate(y_true[:, index], y_pred[:, index])
+                label: calculate(
+                    y_true[:, index],
+                    y_pred[:, index],
+                    reference[:, index] if reference is not None else None,
+                )
                 for index, label in enumerate(("T+1", "T+4", "T+7"))
             }
         return result
 
-    # max_epochs=200: 조기 종료가 없을 때 실행할 최대 학습 횟수입니다.
-    def _train_lstm(self, X_train, y_train, X_val=None, y_val=None, max_epochs=200):
+    @staticmethod
+    def _walk_forward_boundaries(total_rows: int, fold_count: int = 3):
+        """앞 70%를 시작 학습 구간으로 두고 이후 기간을 순서대로 나눕니다."""
+        initial_train_end = int(total_rows * 0.70)
+        boundaries = np.linspace(
+            initial_train_end, total_rows, fold_count + 1, dtype=int
+        )
+        folds = [
+            (int(boundaries[index]), int(boundaries[index + 1]))
+            for index in range(fold_count)
+            if boundaries[index + 1] > boundaries[index]
+        ]
+        if len(folds) != fold_count:
+            raise ValueError("walk-forward fold를 만들기에 데이터가 부족합니다.")
+        return folds
+
+    @staticmethod
+    def _compare_with_naive(model_metrics: dict, naive_metrics: dict):
+        """모델 오차가 직전 종가 유지 기준보다 얼마나 개선됐는지 비교합니다."""
+        def compare(model_result, naive_result):
+            naive_mae = naive_result["mae"]
+            improvement = (
+                (naive_mae - model_result["mae"]) / naive_mae * 100
+                if naive_mae > 1e-8 else 0.0
+            )
+            return {
+                "beats_naive": model_result["mae"] < naive_mae,
+                "mae_improvement_pct": float(improvement),
+            }
+
+        result = compare(model_metrics, naive_metrics)
+        if "by_horizon" in model_metrics and "by_horizon" in naive_metrics:
+            result["by_horizon"] = {
+                horizon: compare(
+                    model_metrics["by_horizon"][horizon],
+                    naive_metrics["by_horizon"][horizon],
+                )
+                for horizon in ("T+1", "T+4", "T+7")
+            }
+        return result
+
+    @staticmethod
+    def _summarize_fold_metrics(fold_results: list):
+        """fold별 성능의 평균과 표준편차를 모델·naive 기준별로 요약합니다."""
+        metric_names = ("mae", "rmse", "mape", "direction_accuracy")
+
+        def summarize(section_name):
+            summary = {}
+            for metric in metric_names:
+                values = [
+                    fold[section_name][metric]
+                    for fold in fold_results
+                    if metric in fold[section_name]
+                ]
+                if values:
+                    summary[metric] = {
+                        "mean": float(np.mean(values)),
+                        "std": float(np.std(values)),
+                    }
+
+            summary["by_horizon"] = {}
+            for horizon in ("T+1", "T+4", "T+7"):
+                summary["by_horizon"][horizon] = {}
+                for metric in metric_names:
+                    values = [
+                        fold[section_name]["by_horizon"][horizon][metric]
+                        for fold in fold_results
+                        if metric in fold[section_name]["by_horizon"][horizon]
+                    ]
+                    if values:
+                        summary["by_horizon"][horizon][metric] = {
+                            "mean": float(np.mean(values)),
+                            "std": float(np.std(values)),
+                        }
+            return summary
+
+        return {
+            "model": summarize("test"),
+            "naive_baseline": summarize("naive_baseline"),
+        }
+
+    @staticmethod
+    def _baseline_warning(metrics: dict, model_name: str):
+        """전체 또는 개별 fold가 naive MAE를 넘지 못하면 경고를 반환합니다."""
+        failed_sections = []
+        if not metrics["comparison"]["beats_naive"]:
+            failed_sections.append("전체")
+        failed_sections.extend(
+            f"fold {fold['fold']}"
+            for fold in metrics["folds"]
+            if not fold["comparison"]["beats_naive"]
+        )
+        if not failed_sections:
+            return None
+        return (
+            f"{model_name} naive baseline 미달: "
+            + ", ".join(failed_sections)
+        )
+
+    # 최대 100 epoch 안에서 검증 손실이 개선되지 않으면 조기 종료합니다.
+    def _train_lstm(self, X_train, y_train, X_val=None, y_val=None, max_epochs=None):
         """LSTM을 학습하고 검증 손실이 개선되지 않으면 일찍 종료합니다."""
+        max_epochs = max_epochs or self.LSTM_MAX_EPOCHS
         # ── 직접 조정하기 쉬운 LSTM 학습 설정 ──
         learning_rate = 0.005  # 학습률: 불안정하면 낮추고, 너무 느리면 조금 높입니다.
         batch_size = 16        # 배치 크기: 작을수록 세밀하지만 학습 시간이 늘어납니다.
@@ -628,7 +757,13 @@ class StockAIAgentV3:
         gradient_clip = 1.0    # 기울기 제한: 학습 중 값이 폭주하는 것을 막습니다.
         patience = 12          # 조기 종료: 검증 손실 개선을 기다리는 epoch 수입니다.
 
-        model = LSTMModel(3, 64, 2, 3, dropout=dropout_rate).to(self.device)
+        model = LSTMModel(
+            input_dim=3,
+            hidden_dim=self.LSTM_HIDDEN_SIZE,
+            num_layers=self.LSTM_NUM_LAYERS,
+            output_dim=3,
+            dropout=dropout_rate,
+        ).to(self.device)
         optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
         # Huber 손실은 급등락 같은 이상치가 학습을 과도하게 흔드는 것을 줄입니다.
         criterion = nn.HuberLoss(delta=huber_delta)
@@ -680,88 +815,209 @@ class StockAIAgentV3:
     # ── LSTM 예측 ─────────────────────────────
     def predict_multi_step(self, df: pd.DataFrame):
         """
-        시간순 70/15/15 분리 후 LSTM의 T+1, T+4, T+7 성능을 검증합니다.
+        시간순 3-fold walk-forward로 LSTM의 T+1, T+4, T+7을 검증합니다.
+        각 fold는 직전 종가를 그대로 예측하는 naive baseline과 비교합니다.
         검증이 끝나면 전체 데이터로 최종 모델을 다시 학습해 미래를 예측합니다.
         """
         np.random.seed(42)
         torch.manual_seed(42)
 
         data = df[['Close', 'USD_KRW', 'SOX_Index']].values.astype(np.float32)
-        seq_len = 20
-        train_end = int(len(data) * 0.70)
-        val_end = int(len(data) * 0.85)
-        if train_end <= seq_len + 7 or len(data) - val_end < 8:
-            raise ValueError("LSTM 학습/검증/테스트 분리에 필요한 데이터가 부족합니다.")
-
-        # 데이터 누수를 막기 위해 평가용 스케일러는 학습 구간에만 맞춥니다.
-        eval_scaler = StandardScaler()
-        eval_scaler.fit(data[:train_end])
-        scaled = eval_scaler.transform(data)
-
-        split_X = {"train": [], "val": [], "test": []}
-        split_y = {"train": [], "val": [], "test": []}
-        for start in range(len(scaled) - seq_len - 6):
-            target_first = start + seq_len
-            target_last = target_first + 6
-            if target_last < train_end:
-                split = "train"
-            elif target_first >= train_end and target_last < val_end:
-                split = "val"
-            elif target_first >= val_end:
-                split = "test"
-            else:
-                # 두 구간의 경계에 걸친 정답은 평가가 섞이지 않도록 제외합니다.
-                continue
-            split_X[split].append(scaled[start:start + seq_len])
-            split_y[split].append([
-                scaled[target_first, 0],
-                scaled[target_first + 3, 0],
-                scaled[target_first + 6, 0],
-            ])
-
-        if any(not split_X[name] for name in ("train", "val", "test")):
-            raise ValueError("LSTM 분할 후 비어 있는 데이터 구간이 있습니다.")
-
-        tensors = {}
-        for split in ("train", "val", "test"):
-            tensors[f"X_{split}"] = torch.tensor(
-                np.asarray(split_X[split]), dtype=torch.float32, device=self.device
-            )
-            tensors[f"y_{split}"] = torch.tensor(
-                np.asarray(split_y[split]), dtype=torch.float32, device=self.device
-            )
-
-        # 학습 70%와 검증 15%로 적절한 epoch 수를 선택합니다.
-        eval_model, best_epoch = self._train_lstm(
-            tensors["X_train"],
-            tensors["y_train"],
-            tensors["X_val"],
-            tensors["y_val"],
+        seq_len = self.LSTM_SEQUENCE_LENGTH
+        fold_boundaries = self._walk_forward_boundaries(
+            len(data), self.WALK_FORWARD_FOLDS
         )
-        eval_model.eval()
-        with torch.no_grad():
-            val_pred_scaled = eval_model(tensors["X_val"]).cpu().numpy()
-            test_pred_scaled = eval_model(tensors["X_test"]).cpu().numpy()
-        val_true_scaled = tensors["y_val"].cpu().numpy()
-        test_true_scaled = tensors["y_test"].cpu().numpy()
+        fold_results = []
+        best_epochs = []
+        oos_predictions = {}
+        all_val_true, all_val_pred = [], []
+        all_test_true, all_test_pred, all_naive_pred = [], [], []
 
-        # 정규화된 종가를 실제 가격 단위로 되돌려 오차를 계산합니다.
-        close_scale = eval_scaler.scale_[0]
-        close_mean = eval_scaler.mean_[0]
-        to_price = lambda values: (values * close_scale) + close_mean
+        for fold_number, (test_start, test_end) in enumerate(fold_boundaries, 1):
+            # 각 fold 학습 구간의 마지막 15%는 조기 종료 검증에만 사용합니다.
+            val_start = int(test_start * 0.85)
+            if val_start <= seq_len + 7 or test_end - test_start < 8:
+                raise ValueError("LSTM walk-forward 분리에 필요한 데이터가 부족합니다.")
+
+            # fold마다 학습 구간 데이터로만 스케일러를 다시 맞춰 누수를 막습니다.
+            scaler = StandardScaler()
+            scaler.fit(data[:val_start])
+            scaled = scaler.transform(data)
+            split_X = {"train": [], "val": []}
+            split_y = {"train": [], "val": []}
+
+            for start in range(len(scaled) - seq_len - 6):
+                target_first = start + seq_len
+                target_last = target_first + 6
+                if target_last < val_start:
+                    split = "train"
+                elif target_first >= val_start and target_last < test_start:
+                    split = "val"
+                else:
+                    # fold 경계에 걸친 정답은 다른 구간 정보가 섞이지 않도록 제외합니다.
+                    continue
+
+                split_X[split].append(scaled[start:start + seq_len])
+                split_y[split].append([
+                    scaled[target_first, 0],
+                    scaled[target_first + 3, 0],
+                    scaled[target_first + 6, 0],
+                ])
+
+            if any(not split_X[name] for name in ("train", "val")):
+                raise ValueError(
+                    f"LSTM walk-forward fold {fold_number}에 빈 구간이 있습니다."
+                )
+
+            tensors = {}
+            for split in ("train", "val"):
+                tensors[f"X_{split}"] = torch.tensor(
+                    np.asarray(split_X[split]),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                tensors[f"y_{split}"] = torch.tensor(
+                    np.asarray(split_y[split]),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+
+            eval_model, fold_best_epoch = self._train_lstm(
+                tensors["X_train"],
+                tensors["y_train"],
+                tensors["X_val"],
+                tensors["y_val"],
+            )
+            best_epochs.append(fold_best_epoch)
+            eval_model.eval()
+            with torch.no_grad():
+                val_pred_scaled = eval_model(tensors["X_val"]).cpu().numpy()
+
+            close_scale = scaler.scale_[0]
+            close_mean = scaler.mean_[0]
+            to_price = lambda values: (values * close_scale) + close_mean
+            val_true = to_price(tensors["y_val"].cpu().numpy())
+            val_pred = to_price(val_pred_scaled)
+
+            # 선택한 epoch로 테스트 직전까지의 모든 과거 데이터를 다시 학습합니다.
+            full_scaler = StandardScaler()
+            full_scaler.fit(data[:test_start])
+            full_scaled = full_scaler.transform(data)
+            full_train_X, full_train_y = [], []
+            full_test_X, full_test_y, full_test_naive = [], [], []
+            test_dates = []
+            for start in range(len(full_scaled) - seq_len - 6):
+                target_first = start + seq_len
+                target_last = target_first + 6
+                features = full_scaled[start:start + seq_len]
+                targets = [
+                    full_scaled[target_first, 0],
+                    full_scaled[target_first + 3, 0],
+                    full_scaled[target_first + 6, 0],
+                ]
+                if target_last < test_start:
+                    full_train_X.append(features)
+                    full_train_y.append(targets)
+                elif target_first >= test_start and target_last < test_end:
+                    test_dates.append(str(df.index[target_first].date()))
+                    full_test_X.append(features)
+                    full_test_y.append(targets)
+                    last_close = float(data[target_first - 1, 0])
+                    full_test_naive.append([last_close, last_close, last_close])
+
+            if not full_train_X or not full_test_X:
+                raise ValueError(
+                    f"LSTM walk-forward fold {fold_number} 재학습 구간이 비었습니다."
+                )
+
+            full_train_X = torch.tensor(
+                np.asarray(full_train_X), dtype=torch.float32, device=self.device
+            )
+            full_train_y = torch.tensor(
+                np.asarray(full_train_y), dtype=torch.float32, device=self.device
+            )
+            full_test_X = torch.tensor(
+                np.asarray(full_test_X), dtype=torch.float32, device=self.device
+            )
+            full_test_y = torch.tensor(
+                np.asarray(full_test_y), dtype=torch.float32, device=self.device
+            )
+            fold_model, _ = self._train_lstm(
+                full_train_X,
+                full_train_y,
+                max_epochs=max(1, fold_best_epoch),
+            )
+            fold_model.eval()
+            with torch.no_grad():
+                test_pred_scaled = fold_model(full_test_X).cpu().numpy()
+
+            full_close_scale = full_scaler.scale_[0]
+            full_close_mean = full_scaler.mean_[0]
+            test_true = (
+                full_test_y.cpu().numpy() * full_close_scale
+            ) + full_close_mean
+            test_pred = (
+                test_pred_scaled * full_close_scale
+            ) + full_close_mean
+            oos_predictions.update(zip(test_dates, map(float, test_pred[:, 0])))
+            naive_pred = np.asarray(full_test_naive, dtype=np.float64)
+
+            model_metrics = self._regression_metrics(
+                test_true, test_pred, naive_pred
+            )
+            naive_metrics = self._regression_metrics(
+                test_true, naive_pred, naive_pred
+            )
+            fold_results.append({
+                "fold": fold_number,
+                "train_end": test_start,
+                "test_range": [test_start, test_end],
+                "best_epoch": fold_best_epoch,
+                "validation": self._regression_metrics(val_true, val_pred),
+                "test": model_metrics,
+                "naive_baseline": naive_metrics,
+                "comparison": self._compare_with_naive(
+                    model_metrics, naive_metrics
+                ),
+                "samples": {
+                    "train": len(full_train_X),
+                    "val": len(split_X["val"]),
+                    "test": len(full_test_X),
+                },
+            })
+            all_val_true.append(val_true)
+            all_val_pred.append(val_pred)
+            all_test_true.append(test_true)
+            all_test_pred.append(test_pred)
+            all_naive_pred.append(naive_pred)
+
+        val_true_all = np.concatenate(all_val_true)
+        val_pred_all = np.concatenate(all_val_pred)
+        test_true_all = np.concatenate(all_test_true)
+        test_pred_all = np.concatenate(all_test_pred)
+        naive_pred_all = np.concatenate(all_naive_pred)
+        test_metrics = self._regression_metrics(
+            test_true_all, test_pred_all, naive_pred_all
+        )
+        naive_metrics = self._regression_metrics(
+            test_true_all, naive_pred_all, naive_pred_all
+        )
+        best_epoch = max(1, int(round(float(np.median(best_epochs)))))
         metrics = {
-            "validation": self._regression_metrics(
-                to_price(val_true_scaled), to_price(val_pred_scaled)
+            "walk_forward_folds": self.WALK_FORWARD_FOLDS,
+            "folds": fold_results,
+            "validation": self._regression_metrics(val_true_all, val_pred_all),
+            "test": test_metrics,
+            "naive_baseline": naive_metrics,
+            "comparison": self._compare_with_naive(
+                test_metrics, naive_metrics
             ),
-            "test": self._regression_metrics(
-                to_price(test_true_scaled), to_price(test_pred_scaled)
-            ),
+            "fold_summary": self._summarize_fold_metrics(fold_results),
             "best_epoch": best_epoch,
-            "split_samples": {
-                split: len(split_X[split])
-                for split in ("train", "val", "test")
-            },
         }
+        metrics["oos_t1_predictions"] = oos_predictions
+        metrics["baseline_warning"] = self._baseline_warning(metrics, "LSTM")
+        metrics["meets_baseline"] = metrics["baseline_warning"] is None
 
         # 실제 미래 예측은 최신 정보까지 활용하도록 전체 데이터로 다시 학습합니다.
         final_scaler = StandardScaler()
@@ -797,7 +1053,8 @@ class StockAIAgentV3:
     # ── TabPFN 예측 ───────────────────────────
     def predict_tabpfn(self, df: pd.DataFrame):
         """
-        시간순 70/15/15 분리로 TabPFN의 성능을 검증합니다.
+        시간순 3-fold walk-forward로 TabPFN의 성능을 검증합니다.
+        각 fold는 직전 종가를 유지하는 naive baseline과 비교합니다.
         T+1, T+4, T+7은 각각 별도 회귀 모델로 직접 예측합니다.
         """
         if not TABPFN_AVAILABLE:
@@ -815,11 +1072,9 @@ class StockAIAgentV3:
             feat_cols = ['Close', 'USD_KRW', 'SOX_Index', 'RSI', 'EMA20', 'Volume']
             look_back = 10   # 과거 N일을 피처로 사용
 
-            train_end = int(len(tdf) * 0.70)
-            val_end = int(len(tdf) * 0.85)
-            split_X = {"train": [], "val": [], "test": []}
-            split_y = {"train": [], "val": [], "test": []}
             all_X, all_y = [], []
+            target_first_indices, target_last_indices = [], []
+            all_naive = []
 
             # 과거 10일을 입력으로 만들고 세 미래 시점의 종가를 정답으로 둡니다.
             for i in range(look_back, len(tdf) - 6):
@@ -831,55 +1086,105 @@ class StockAIAgentV3:
                 ]
                 all_X.append(window)
                 all_y.append(targets)
+                target_first_indices.append(i)
+                target_last_indices.append(i + 6)
+                last_close = float(tdf['Close'].iloc[i - 1])
+                all_naive.append([last_close, last_close, last_close])
 
-                target_last = i + 6
-                if target_last < train_end:
-                    split = "train"
-                elif i >= train_end and target_last < val_end:
-                    split = "val"
-                elif i >= val_end:
-                    split = "test"
-                else:
-                    # T+7 정답이 다음 구간에 걸치면 누수를 막기 위해 제외합니다.
-                    continue
-                split_X[split].append(window)
-                split_y[split].append(targets)
+            all_X = np.asarray(all_X, dtype=np.float32)
+            all_y = np.asarray(all_y, dtype=np.float32)
+            all_naive = np.asarray(all_naive, dtype=np.float32)
+            target_first_indices = np.asarray(target_first_indices)
+            target_last_indices = np.asarray(target_last_indices)
 
-            if any(not split_X[name] for name in ("train", "val", "test")):
-                raise ValueError("TabPFN 분할 후 비어 있는 데이터 구간이 있습니다.")
-
-            # TabPFN 권장 한도보다 많으면 각 구간의 최신 샘플을 사용합니다.
+            # TabPFN 권장 한도보다 많으면 각 fold의 최신 학습 샘플을 사용합니다.
             max_samples = 1000
-            arrays = {}
-            for split in ("train", "val", "test"):
-                arrays[f"X_{split}"] = np.asarray(
-                    split_X[split][-max_samples:], dtype=np.float32
-                )
-                arrays[f"y_{split}"] = np.asarray(
-                    split_y[split][-max_samples:], dtype=np.float32
-                )
-            X_train, y_train = arrays["X_train"], arrays["y_train"]
-            X_val, y_val = arrays["X_val"], arrays["y_val"]
-            X_test, y_test = arrays["X_test"], arrays["y_test"]
+            fold_boundaries = self._walk_forward_boundaries(
+                len(tdf), self.WALK_FORWARD_FOLDS
+            )
+            fold_results = []
+            all_test_true, all_test_pred, all_naive_pred = [], [], []
+            oos_predictions = {}
 
-            # 평가 모델은 학습 구간만 보고 검증·테스트 구간을 예측합니다.
-            val_predictions = np.zeros_like(y_val)
-            test_predictions = np.zeros_like(y_test)
-            for horizon in range(3):
-                reg = TabPFNRegressor()
-                reg.fit(X_train, y_train[:, horizon])
-                val_predictions[:, horizon] = reg.predict(X_val)
-                test_predictions[:, horizon] = reg.predict(X_test)
+            for fold_number, (test_start, test_end) in enumerate(
+                fold_boundaries, 1
+            ):
+                train_indices = np.flatnonzero(target_last_indices < test_start)
+                test_indices = np.flatnonzero(
+                    (target_first_indices >= test_start)
+                    & (target_last_indices < test_end)
+                )
+                if not len(train_indices) or not len(test_indices):
+                    raise ValueError(
+                        f"TabPFN walk-forward fold {fold_number}에 빈 구간이 있습니다."
+                    )
 
+                train_indices = train_indices[-max_samples:]
+                X_train = all_X[train_indices]
+                y_train = all_y[train_indices]
+                X_test = all_X[test_indices]
+                y_test = all_y[test_indices]
+                naive_pred = all_naive[test_indices]
+                test_predictions = np.zeros_like(y_test)
+
+                # fold 시작 전 데이터만 학습하고 이후 구간을 순서대로 평가합니다.
+                for horizon in range(3):
+                    reg = TabPFNRegressor()
+                    reg.fit(X_train, y_train[:, horizon])
+                    test_predictions[:, horizon] = reg.predict(X_test)
+
+                oos_predictions.update({
+                    str(tdf.index[target_first_indices[idx]].date()): float(pred)
+                    for idx, pred in zip(test_indices, test_predictions[:, 0])
+                })
+                model_metrics = self._regression_metrics(
+                    y_test, test_predictions, naive_pred
+                )
+                naive_metrics = self._regression_metrics(
+                    y_test, naive_pred, naive_pred
+                )
+                fold_results.append({
+                    "fold": fold_number,
+                    "train_end": test_start,
+                    "test_range": [test_start, test_end],
+                    "test": model_metrics,
+                    "naive_baseline": naive_metrics,
+                    "comparison": self._compare_with_naive(
+                        model_metrics, naive_metrics
+                    ),
+                    "samples": {
+                        "train": len(X_train),
+                        "test": len(X_test),
+                    },
+                })
+                all_test_true.append(y_test)
+                all_test_pred.append(test_predictions)
+                all_naive_pred.append(naive_pred)
+
+            test_true_all = np.concatenate(all_test_true)
+            test_pred_all = np.concatenate(all_test_pred)
+            naive_pred_all = np.concatenate(all_naive_pred)
+            test_metrics = self._regression_metrics(
+                test_true_all, test_pred_all, naive_pred_all
+            )
+            naive_metrics = self._regression_metrics(
+                test_true_all, naive_pred_all, naive_pred_all
+            )
             metrics = {
-                "validation": self._regression_metrics(y_val, val_predictions),
-                "test": self._regression_metrics(y_test, test_predictions),
-                "split_samples": {
-                    "train": len(X_train),
-                    "val": len(X_val),
-                    "test": len(X_test),
-                },
+                "walk_forward_folds": self.WALK_FORWARD_FOLDS,
+                "folds": fold_results,
+                "test": test_metrics,
+                "naive_baseline": naive_metrics,
+                "comparison": self._compare_with_naive(
+                    test_metrics, naive_metrics
+                ),
+                "fold_summary": self._summarize_fold_metrics(fold_results),
             }
+            metrics["oos_t1_predictions"] = oos_predictions
+            metrics["baseline_warning"] = self._baseline_warning(
+                metrics, "TabPFN"
+            )
+            metrics["meets_baseline"] = metrics["baseline_warning"] is None
 
             # 최종 예측 모델은 검증이 끝난 뒤 전체 과거 데이터를 사용합니다.
             latest_window = (
@@ -887,8 +1192,8 @@ class StockAIAgentV3:
                 .astype(np.float32)
                 .reshape(1, -1)
             )
-            X_arr = np.asarray(all_X[-max_samples:], dtype=np.float32)
-            y_arr = np.asarray(all_y[-max_samples:], dtype=np.float32)
+            X_arr = all_X[-max_samples:]
+            y_arr = all_y[-max_samples:]
             final_predictions = []
             for horizon in range(3):
                 reg = TabPFNRegressor()
@@ -937,7 +1242,7 @@ class StockAIAgentV3:
             mean_grads = grads.mean(dim=0)  # (seq_len, n_feat)
             ig = (inp.squeeze(0) - baseline.squeeze(0)) * mean_grads  # (seq_len, n_feat)
 
-            # 20일 축 합산 → 피처별 기여도 (n_feat,)
+            # 전체 시퀀스 축 합산 → 피처별 기여도 (n_feat,)
             feat_contrib = ig.abs().sum(dim=0).detach().cpu().numpy()  # (n_feat,)
 
             total = feat_contrib.sum()
@@ -953,31 +1258,6 @@ class StockAIAgentV3:
             # 실패 시 가짜 고정 중요도를 만들지 않습니다.
             return {}
 
-    # ── 기여도 시각화 ─────────────────────────
-    def visualize_feature_importance(
-        self, name: str, importance_dict: dict
-    ) -> str | None:
-        """피처 기여도를 수평 막대 차트로 저장하고 파일명을 반환합니다."""
-        if not importance_dict:
-            return None
-        features   = list(importance_dict.keys())
-        values     = list(importance_dict.values())
-        sorted_idx = np.argsort(values)
-        features   = [features[i] for i in sorted_idx]
-        values     = [values[i] for i in sorted_idx]
-
-        plt.figure(figsize=(10, 6))
-        colors = plt.cm.GnBu(np.linspace(0.4, 0.8, len(values)))
-        plt.barh(features, values, color=colors)
-        plt.title(f"이번 예측 기여도 - {name}")
-        plt.xlabel("정규화된 기여도 (Integrated Gradients)")
-        plt.tight_layout()
-
-        filename = f"contribution_{name}.png"
-        plt.savefig(filename)
-        plt.close()
-        return filename
-
     # ── V3 단독 실행 리포트 ───────────────────
     def run(self):
         """모든 종목에 대해 ML 분석 리포트를 콘솔에 출력합니다."""
@@ -991,17 +1271,12 @@ class StockAIAgentV3:
                 bt_ret = result["bt_ret"]
                 sharpe = result["sharpe"]
                 mdd = result["mdd"]
-                sentiment = result["sentiment"]
                 titles = result["titles"]
                 news_articles = result["news_articles"]
                 preds = result["preds"]
                 tabpfn_preds = result["tabpfn_preds"]
                 lstm_metrics = result["lstm_metrics"]
                 tabpfn_metrics = result["tabpfn_metrics"]
-                imp = self.get_feature_importance(
-                    result["model"], result["l_seq"], result.get("baseline_seq")
-                )
-                chart_file = self.visualize_feature_importance(name, imp)
 
                 print(f"{'='*65}")
                 print(f"🚀 [AI Agent V3.2 리포트: {name} ({symbol})]")
@@ -1013,12 +1288,6 @@ class StockAIAgentV3:
 
                 print(f"📊 현재가: {last_p:,.0f} | 추세: {trend} (RSI: {rsi_v:.2f})")
                 print(f"📈 전략 수익률: {bt_ret:.2f}% | Sharpe: {sharpe:.2f} | MDD: {mdd:.2f}%")
-                sentiment_label = (
-                    "긍정" if sentiment > 0.05
-                    else "부정" if sentiment < -0.05
-                    else "중립"
-                )
-                print(f"📰 뉴스 심리: {sentiment_label} (Score: {sentiment:.2f})")
                 if news_articles:
                     for article in news_articles:
                         print(
@@ -1030,30 +1299,71 @@ class StockAIAgentV3:
                         print(f"      {i+1}. {title[:50]}...")
 
                 # ── LSTM 예측 출력 ──
-                print(f"🔮 [LSTM]   예보: [내일] {preds[0]:,.2f} | [4일뒤] {preds[1]:,.2f} | [7일뒤] {preds[2]:,.2f}")
+                print(f"🔮 [LSTM]   예보: [T+1 {result['target_t1']}] {preds[0]:,.2f} | [T+4 {result['target_t4']}] {preds[1]:,.2f} | [T+7 {result['target_t7']}] {preds[2]:,.2f}")
                 lstm_test = lstm_metrics["test"]
                 print(
                     f"   ✅ 평가 모델 테스트 오차: MAE {lstm_test['mae']:,.2f} | "
-                    f"RMSE {lstm_test['rmse']:,.2f} | MAPE {lstm_test['mape']:.2f}%"
+                    f"RMSE {lstm_test['rmse']:,.2f} | MAPE {lstm_test['mape']:.2f}% | "
+                    f"방향 정확도 {lstm_test['direction_accuracy']:.2f}%"
                 )
+                lstm_naive = lstm_metrics["naive_baseline"]
+                lstm_compare = lstm_metrics["comparison"]
+                print(
+                    f"   📏 3-fold naive 기준: MAE {lstm_naive['mae']:,.2f} | "
+                    f"개선율 {lstm_compare['mae_improvement_pct']:+.2f}% | "
+                    f"{'LSTM 우수' if lstm_compare['beats_naive'] else 'naive 우수'}"
+                )
+                lstm_summary = lstm_metrics["fold_summary"]["model"]
+                print(
+                    f"   📊 fold 평균±표준편차: "
+                    f"MAE {lstm_summary['mae']['mean']:,.2f}±{lstm_summary['mae']['std']:,.2f} | "
+                    f"방향 {lstm_summary['direction_accuracy']['mean']:.2f}"
+                    f"±{lstm_summary['direction_accuracy']['std']:.2f}%"
+                )
+                for fold in lstm_metrics["folds"]:
+                    print(
+                        f"      fold {fold['fold']}: "
+                        f"LSTM MAE {fold['test']['mae']:,.2f} / "
+                        f"naive MAE {fold['naive_baseline']['mae']:,.2f} | "
+                        f"방향 {fold['test']['direction_accuracy']:.2f}%"
+                    )
 
                 # ── TabPFN 예측 출력 ──
                 if tabpfn_preds:
-                    print(f"🔮 [TabPFN] 예보: [내일] {tabpfn_preds[0]:,.2f} | [4일뒤] {tabpfn_preds[1]:,.2f} | [7일뒤] {tabpfn_preds[2]:,.2f}")
+                    print(f"🔮 [TabPFN] 예보: [T+1 {result['target_t1']}] {tabpfn_preds[0]:,.2f} | [T+4 {result['target_t4']}] {tabpfn_preds[1]:,.2f} | [T+7 {result['target_t7']}] {tabpfn_preds[2]:,.2f}")
                     tabpfn_test = tabpfn_metrics["test"]
                     print(
                         f"   ✅ 평가 모델 테스트 오차: MAE {tabpfn_test['mae']:,.2f} | "
-                        f"RMSE {tabpfn_test['rmse']:,.2f} | MAPE {tabpfn_test['mape']:.2f}%"
+                        f"RMSE {tabpfn_test['rmse']:,.2f} | MAPE {tabpfn_test['mape']:.2f}% | "
+                        f"방향 정확도 {tabpfn_test['direction_accuracy']:.2f}%"
                     )
+                    tabpfn_naive = tabpfn_metrics["naive_baseline"]
+                    tabpfn_compare = tabpfn_metrics["comparison"]
+                    print(
+                        f"   📏 3-fold naive 기준: MAE {tabpfn_naive['mae']:,.2f} | "
+                        f"개선율 {tabpfn_compare['mae_improvement_pct']:+.2f}% | "
+                        f"{'TabPFN 우수' if tabpfn_compare['beats_naive'] else 'naive 우수'}"
+                    )
+                    tabpfn_summary = tabpfn_metrics["fold_summary"]["model"]
+                    print(
+                        f"   📊 fold 평균±표준편차: "
+                        f"MAE {tabpfn_summary['mae']['mean']:,.2f}"
+                        f"±{tabpfn_summary['mae']['std']:,.2f} | "
+                        f"방향 {tabpfn_summary['direction_accuracy']['mean']:.2f}"
+                        f"±{tabpfn_summary['direction_accuracy']['std']:.2f}%"
+                    )
+                    for fold in tabpfn_metrics["folds"]:
+                        print(
+                            f"      fold {fold['fold']}: "
+                            f"TabPFN MAE {fold['test']['mae']:,.2f} / "
+                            f"naive MAE {fold['naive_baseline']['mae']:,.2f} | "
+                            f"방향 {fold['test']['direction_accuracy']:.2f}%"
+                        )
                     diff1 = tabpfn_preds[0] - preds[0]
                     print(f"   📐 모델 차이(T+1): {diff1:+,.2f} ({'TabPFN 높음' if diff1 > 0 else 'LSTM 높음'})")
                 else:
                     print(f"🔮 [TabPFN] 예보: 사용 불가")
 
-                if chart_file:
-                    print(f"🔍 실제 피처 기여도 시각화 완료: {chart_file}")
-                else:
-                    print("⚠️ 피처 기여도 계산 실패로 시각화를 건너뜁니다.")
                 print(f"{'='*65}\n")
 
             except Exception as e:
@@ -1074,7 +1384,7 @@ class StockAIAgentV3:
                     "bt_ret": float,
                     "sharpe": float,
                     "mdd": float,
-                    "sentiment": float,
+                    "analysis_id": int,
                     "titles": list[str],
                     "preds": list[float],
                     "tabpfn_preds": list[float] | None,
@@ -1105,3 +1415,5 @@ class StockAIAgentV3:
 if __name__ == "__main__":
     agent = StockAIAgentV3()
     agent.run()
+    from cleanup_history import maintain_history
+    maintain_history(agent.db_path)

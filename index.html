@@ -115,13 +115,19 @@
               <span class="panel-label">RSI (14)</span>
               <canvas id="live-rsi-chart"></canvas>
             </div>
+            <div class="live-macd-panel">
+              <span class="panel-label">MACD · SIGNAL · OSC (12, 26, 9)</span>
+              <canvas id="live-macd-chart" aria-label="MACD와 시그널선 및 오실레이터"></canvas>
+            </div>
           </div>
         </section>
 
         <section class="prediction-section" id="prediction-section" aria-labelledby="prediction-title">
           <h3 class="prediction-title" id="prediction-title">AI 모델 가격 예측</h3>
-          <div class="prediction-cards" id="prediction-cards"></div>
+          <p class="prediction-context" id="prediction-context"></p>
           <div class="model-prediction-details" id="model-prediction-details"></div>
+          <div id="t1-realized-results" aria-live="polite"></div>
+          <div class="model-validation-results" id="model-validation-results"></div>
         </section>
       </div>
     </main>

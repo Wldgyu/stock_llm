@@ -816,6 +816,109 @@ button {
   white-space: nowrap;
 }
 
+.model-validation-results {
+  margin-top: 8px;
+}
+
+.validation-title {
+  margin-bottom: 9px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.validation-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.validation-card {
+  padding: 13px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.validation-card.warning {
+  border-color: rgba(255, 77, 109, 0.55);
+}
+
+.validation-card.passed {
+  border-color: rgba(0, 229, 160, 0.35);
+}
+
+.validation-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.validation-card-header strong {
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.validation-card-header span {
+  color: var(--text-muted);
+  font-size: 9px;
+}
+
+.validation-card.warning .validation-card-header span,
+.validation-warning {
+  color: var(--red);
+}
+
+.validation-card.passed .validation-card-header span {
+  color: var(--green);
+}
+
+.validation-warning {
+  margin: -3px 0 10px;
+  font-size: 10px;
+}
+
+.validation-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.validation-metrics span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.validation-metrics small,
+.fold-summary span {
+  color: var(--text-muted);
+  font-size: 9px;
+}
+
+.validation-metrics b {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font: 600 10px "JetBrains Mono", monospace;
+  text-overflow: ellipsis;
+}
+
+.fold-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 12px;
+  margin-top: 11px;
+  padding-top: 9px;
+  border-top: 1px solid var(--border);
+}
+
+.fold-summary strong {
+  width: 100%;
+  color: var(--text-secondary);
+  font-size: 9px;
+}
+
 .empty-inline,
 .empty-state {
   grid-column: 1 / -1;
@@ -1115,6 +1218,7 @@ button {
   }
 
   .prediction-cards,
+  .validation-grid,
   .ai-personas-grid {
     grid-template-columns: 1fr;
   }
@@ -1128,3 +1232,14 @@ button {
     padding: 18px 16px 26px;
   }
 }
+
+.prediction-context { color: #9aa9bf; font-size: 13px; line-height: 1.6; margin: 8px 0 16px; }
+.prediction-change { font-variant-numeric: tabular-nums; }
+
+#t1-realized-results { margin:24px 0; }
+#t1-realized-results p { color:#9aa9bf;font-size:13px; }
+.t1-table-scroll { overflow:auto;max-height:440px; }
+.t1-history-table { border-collapse:collapse;width:100%;font-size:13px;white-space:nowrap; }
+.t1-history-table th,.t1-history-table td { padding:10px;border-bottom:1px solid #334155;text-align:left; }
+
+.live-macd-panel { position:relative;height:240px;min-width:0;padding:28px 12px 10px;background:rgba(8,13,26,.35);border-radius:12px; }
