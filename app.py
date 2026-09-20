@@ -8,6 +8,8 @@ SQLite의 ML/LLM 분석 결과와 yfinance 실시간 시세를 하나의 Flask �
 import json
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -42,6 +44,8 @@ _candle_cache = {}
 _dynamic_watchlist = {}
 _cache_lock = threading.Lock()
 _poll_thread = None
+_analysis_job_lock = threading.Lock()
+_analysis_job = {"status": "idle", "name": None, "mode": None, "message": ""}
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9.^=-]{1,24}$")
 
 
@@ -707,6 +711,66 @@ def api_stock_ai(name):
         return jsonify({"name": name, "personas": personas, "final": final})
     finally:
         connection.close()
+
+
+def _run_analysis_job(name, mode):
+    """별도 Python 프로세스에서 한 종목을 분석하고 진행 상황을 보관합니다."""
+    global _analysis_job
+    command = [sys.executable, "-B", "-u", os.path.join(BASE_DIR, "llm_stock.py"),
+               "--mode", mode, "--name", name]
+    try:
+        with subprocess.Popen(
+            command, cwd=BASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ) as process:
+            for line in process.stdout:
+                message = line.strip()
+                if message:
+                    print(f"[분석 작업] {message}")
+                    with _analysis_job_lock:
+                        if not message.startswith("Traceback"):
+                            _analysis_job["message"] = message[:200]
+            code = process.wait()
+        with _analysis_job_lock:
+            _analysis_job["status"] = "complete" if code == 0 else "failed"
+            _analysis_job["message"] = ("분석 완료" if code == 0 else
+                                          f"분석 프로세스 종료 코드 {code}; 서버 로그를 확인하세요.")
+    except Exception as exc:
+        with _analysis_job_lock:
+            _analysis_job["status"] = "failed"
+            _analysis_job["message"] = f"분석 시작 실패: {exc}"
+
+
+@app.route("/api/analysis-job", methods=["GET", "POST"])
+def api_analysis_job():
+    global _analysis_job
+    if request.method == "GET":
+        with _analysis_job_lock:
+            return jsonify(dict(_analysis_job))
+    if request.remote_addr not in ("127.0.0.1", "::1"):
+        return jsonify({"error": "분석 시작은 이 컴퓨터에서만 가능합니다."}), 403
+    if not request.is_json:
+        return jsonify({"error": "JSON 요청이 필요합니다."}), 415
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "JSON 객체가 필요합니다."}), 400
+    name, mode = payload.get("name"), payload.get("mode")
+    if name not in ("삼성전자", "엔비디아", "인텔") or mode not in ("simple", "professional"):
+        return jsonify({"error": "지원하지 않는 종목 또는 분석 모드입니다."}), 400
+    with _analysis_job_lock:
+        if _analysis_job["status"] == "running":
+            return jsonify({"error": "다른 분석이 진행 중입니다.", **_analysis_job}), 409
+        _analysis_job = {"status": "running", "name": name, "mode": mode,
+                         "message": "분석 프로세스를 시작하는 중..."}
+    try:
+        threading.Thread(target=_run_analysis_job, args=(name, mode), daemon=True).start()
+    except Exception as exc:
+        with _analysis_job_lock:
+            _analysis_job["status"] = "failed"
+            _analysis_job["message"] = f"분석 작업 시작 실패: {exc}"
+        return jsonify(dict(_analysis_job)), 500
+    return jsonify(dict(_analysis_job)), 202
 
 
 # ---------------------------------------------------------------------------

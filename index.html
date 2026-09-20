@@ -138,6 +138,15 @@
           <div class="ai-panel-title">🤖 AI 페르소나 분석 — <span id="ai-stock-name"></span></div>
           <button class="ai-panel-close" id="ai-close-button" type="button" aria-label="닫기">✕</button>
         </div>
+        <div class="ai-run-controls" id="ai-run-controls">
+          <label for="ai-analysis-mode">분석 방식</label>
+          <select id="ai-analysis-mode">
+            <option value="simple">간단 · Gemma4 12B</option>
+            <option value="professional">전문 · NVIDIA</option>
+          </select>
+          <button id="ai-run-button" type="button">이 종목 분석 시작</button>
+          <p id="ai-run-status" role="status" aria-live="polite"></p>
+        </div>
         <div id="ai-panel-content"></div>
       </div>
     </aside>

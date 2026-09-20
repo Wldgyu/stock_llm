@@ -15,6 +15,7 @@ const state = {
   candleTimer: null,
   requestId: 0,
   aiOpen: false,
+  analysisTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -693,6 +694,50 @@ function personaIcon(persona) {
   return { 주식전문가: "📊", 뉴스기업전문가: "📰", 최종결정자: "⚖️" }[persona] || "🤖";
 }
 
+async function updateAnalysisJob() {
+  try {
+    const job = await fetchJson(`${API}/api/analysis-job`);
+    const running = job.status === "running";
+    $("ai-run-button").disabled = running;
+    $("ai-run-status").textContent = running
+      ? `${job.name} ${job.mode === "professional" ? "전문" : "간단"} 분석 중 · ${job.message}`
+      : job.status === "failed" ? `분석 실패 · ${job.message}`
+      : job.status === "complete" ? `${job.name} 분석 완료` : "";
+    if (running && !state.analysisTimer) {
+      state.analysisTimer = setInterval(updateAnalysisJob, 3000);
+    } else if (!running && state.analysisTimer) {
+      clearInterval(state.analysisTimer);
+      state.analysisTimer = null;
+      if (job.status === "complete" && state.aiOpen && state.currentName === job.name) {
+        await openAiPanel();
+        await loadStocks();
+      }
+    }
+  } catch (error) {
+    $("ai-run-status").textContent = `진행 상태 조회 실패: ${error.message}`;
+  }
+}
+
+async function startAiAnalysis() {
+  const name = state.currentName;
+  if (!name) return;
+  const mode = $("ai-analysis-mode").value;
+  $("ai-run-button").disabled = true;
+  $("ai-run-status").textContent = `${name} 분석 시작 요청 중...`;
+  try {
+    const response = await fetch(`${API}/api/analysis-job`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, mode }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    await updateAnalysisJob();
+  } catch (error) {
+    $("ai-run-status").textContent = `분석 시작 실패: ${error.message}`;
+    $("ai-run-button").disabled = false;
+  }
+}
+
 async function openAiPanel() {
   if (!state.currentName) return;
   state.aiOpen = true;
@@ -700,6 +745,8 @@ async function openAiPanel() {
   $("ai-panel").setAttribute("aria-hidden", "false");
   $("ai-button").classList.add("active");
   $("ai-stock-name").textContent = state.currentName;
+  $("ai-run-controls").hidden = !["삼성전자", "엔비디아", "인텔"].includes(state.currentName);
+  updateAnalysisJob();
   const content = $("ai-panel-content");
   content.innerHTML = '<div class="ai-loading"><span class="spinner"></span><span>AI 분석 로드 중...</span></div>';
 
@@ -748,6 +795,8 @@ async function openAiPanel() {
 }
 
 function closeAiPanel() {
+  clearInterval(state.analysisTimer);
+  state.analysisTimer = null;
   state.aiOpen = false;
   $("ai-panel").classList.remove("open");
   $("ai-panel").setAttribute("aria-hidden", "true");
@@ -770,6 +819,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("back-button").addEventListener("click", goHome);
   $("ai-button").addEventListener("click", () => state.aiOpen ? closeAiPanel() : openAiPanel());
   $("ai-close-button").addEventListener("click", closeAiPanel);
+  $("ai-run-button").addEventListener("click", startAiAnalysis);
   $("stock-search-form").addEventListener("submit", (event) => {
     event.preventDefault();
     searchStocks();

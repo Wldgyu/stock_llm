@@ -974,6 +974,28 @@ button {
   font-weight: 700;
 }
 
+.ai-run-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.ai-run-controls[hidden] { display: none; }
+
+.ai-run-controls select,
+.ai-run-controls button {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  color: var(--text-primary);
+  background: var(--bg-card);
+  font: inherit;
+}
+
+.ai-run-controls button { cursor: pointer; }
+.ai-run-controls button:disabled { opacity: .55; cursor: wait; }
+#ai-run-status { flex-basis: 100%; margin: 0; color: var(--text-secondary); font-size: 13px; }
+
 #ai-stock-name {
   color: var(--cyan);
 }

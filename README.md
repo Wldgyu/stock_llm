@@ -141,7 +141,21 @@ TabPFN 실행이 불가능하면 해당 예측만 건너뛰고 LSTM 분석을 �
 
 ### 2. LLM 페르소나 분석
 
-Ollama 서버와 기본 `gemma4:12b` 모델을 준비한 뒤 실행합니다.
+`.env`의 `LLM_ANALYSIS_MODE`로 분석 방식을 선택한 뒤 실행합니다.
+`simple`은 기존 Ollama `gemma4:12b`로 분석하고,
+`professional`은 `NVIDIA_TOKEN`으로 NVIDIA 무료 시험 엔드포인트의
+`nvidia/nemotron-3-super-120b-a12b`를 호출합니다. `gemma4:1b` 태그는
+Ollama 공식 목록에 없어 기존에 사용하던 `gemma4:12b`를 유지합니다.
+전문 분석의 주식전문가에게만 기존 상세 자료 중 실제 사전 T+1 방향 적중률과
+평가 건수를 추가합니다. 뉴스전문가에는 뉴스, 최종결정자에는 두 전문가 의견만 보냅니다.
+간단 분석은 기존 Ollama 서버의 `gemma4:12b`를 사용합니다.
+터미널에서 `llm_stock.py`를 인수 없이 실행하면 `[1] 간단 / [2] 전문`을 선택합니다.
+자동 실행에서는 `--mode simple` 또는 `--mode professional`을 지정할 수 있습니다.
+`--name 삼성전자`처럼 종목명을 지정하면 해당 종목만 분석합니다.
+대시보드에서는 종목 상세 화면의 **AI 분석 보기**를 열고 분석 방식과
+**이 종목 분석 시작** 버튼을 누르면 백그라운드 작업을 시작합니다.
+ML 재학습부터 수행하므로 결과가 나오기까지 시간이 걸릴 수 있으며,
+한 번에 한 종목만 실행합니다. 서버를 다시 시작하면 진행 상태는 초기화됩니다.
 
 ```powershell
 & "C:\Users\dark0\miniconda3\envs\stock_ai_312\python.exe" llm_stock.py
@@ -151,8 +165,10 @@ Ollama 서버와 기본 `gemma4:12b` 모델을 준비한 뒤 실행합니다.
 설정 가능한 환경변수:
 
 - `OLLAMA_HOST`: 기본값 `127.0.0.1`
-- `OLLAMA_EXPERT_MODEL`: 기본값 `gemma4:12b`
-- `OLLAMA_DECISION_MODEL`: 기본값 `gemma4:12b`
+- `LLM_ANALYSIS_MODE`: `simple` 또는 `professional` (기본값 `simple`)
+- `OLLAMA_EXPERT_MODEL`, `OLLAMA_DECISION_MODEL`: 간단 분석 기본값 `gemma4:12b`
+- `NVIDIA_TOKEN`: 전문 분석 API 키
+- `NVIDIA_MODEL`: 전문 분석 기본값 `nvidia/nemotron-3-super-120b-a12b`
 - `OLLAMA_PAUSE_SECONDS`: 페르소나 호출 사이 대기, 기본값 `15`
 - `DB_PATH`: 기본 경로 대신 사용할 SQLite 파일
 

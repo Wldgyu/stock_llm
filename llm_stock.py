@@ -1,6 +1,7 @@
 """가격·뉴스 전문가와 최종결정자의 Ollama 분석 및 DB 저장. 실행: python llm_stock.py."""
 
 import json
+import argparse
 import math
 import os
 import re
@@ -31,11 +32,21 @@ class MarketAgentSimulator:
         server_ip: Optional[str] = None,
         expert_model: str = "gemma4:12b",
         decision_model: str = "gemma4:12b",
+        analysis_mode: str = "simple",
+        nvidia_model: str = "nvidia/nemotron-3-super-120b-a12b",
     ):
         self.server_ip      = server_ip or os.environ.get("OLLAMA_HOST", "127.0.0.1")
         self.expert_model   = expert_model
         self.decision_model = decision_model
         self.url            = f"http://{self.server_ip}:11434/api/generate"
+        if analysis_mode not in ("simple", "professional"):
+            raise ValueError("LLM_ANALYSIS_MODE는 simple 또는 professional이어야 합니다.")
+        self.analysis_mode = analysis_mode
+        self.nvidia_model = nvidia_model
+        self.nvidia_token = os.environ.get("NVIDIA_TOKEN", "").strip()
+        self.nvidia_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+        if analysis_mode == "professional" and not self.nvidia_token:
+            raise ValueError("전문 분석에는 .env의 NVIDIA_TOKEN이 필요합니다.")
         self.request_timeout = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "600"))
         if not math.isfinite(self.request_timeout) or self.request_timeout <= 0:
             raise ValueError("OLLAMA_TIMEOUT_SECONDS는 양의 유한한 초 단위 숫자여야 합니다.")
@@ -66,7 +77,47 @@ class MarketAgentSimulator:
             f"<end_of_turn>\n<start_of_turn>user\n{context}\n"
             f"<end_of_turn>\n<start_of_turn>model\n"
         )
+        if self.analysis_mode == "professional":
+            return self._send_nvidia_request(persona, instructions, context, max_chars)
         return self._send_request(persona, prompt, model_name=model)
+
+    def _send_nvidia_request(self, persona, instructions, context, max_chars):
+        """NVIDIA 무료 시험 엔드포인트에 역할별 자료를 보냅니다."""
+        payload = {
+            "model": self.nvidia_model,
+            "messages": [
+                {"role": "system", "content": (
+                    f"당신은 {persona}입니다. 한국어로 답하세요. "
+                    f"{self.ANALYSIS_RULES}{instructions} "
+                    f"JSON 점수 줄을 제외한 의견은 {max_chars}자 이내로 쓰세요.")},
+                {"role": "user", "content": context},
+            ],
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "max_tokens": 4096,
+            "chat_template_kwargs": {"enable_thinking": True, "low_effort": True},
+            "stream": False,
+        }
+        started = time.monotonic()
+        try:
+            print(f"      ⏳ {self.nvidia_model}: {persona} 입력 {len(context):,}자, 제한 {self.request_timeout:g}초")
+            response = requests.post(
+                self.nvidia_url,
+                headers={"Authorization": f"Bearer {self.nvidia_token}"},
+                json=payload,
+                timeout=(15, self.request_timeout),
+            )
+            response.raise_for_status()
+            message = response.json()["choices"][0]["message"]
+            print(f"      ✅ {persona} 응답 수신 ({time.monotonic() - started:.1f}초)")
+            return (message.get("content") or "").strip() or None
+        except requests.exceptions.RequestException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            print(f"      ❌ NVIDIA {persona} 요청 실패: HTTP {status}" if status else
+                  f"      ❌ NVIDIA {persona} 통신 오류: {exc}")
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            print(f"      ❌ NVIDIA {persona} 응답 형식 오류: {exc}")
+        return None
 
     def run_stock_expert(self, ticker_name, current_price_desc, prediction_info):
         return self._run_persona(
@@ -203,6 +254,8 @@ class StockAIAgentV4(StockAIAgentV3):
             server_ip=server_ip,
             expert_model=os.environ.get("OLLAMA_EXPERT_MODEL", "gemma4:12b"),
             decision_model=os.environ.get("OLLAMA_DECISION_MODEL", "gemma4:12b"),
+            analysis_mode=os.environ.get("LLM_ANALYSIS_MODE", "simple").lower(),
+            nvidia_model=os.environ.get("NVIDIA_MODEL", "nvidia/nemotron-3-super-120b-a12b"),
         )
         self.pause_seconds = float(os.environ.get("OLLAMA_PAUSE_SECONDS", "15"))
         self._init_persona_db()
@@ -326,9 +379,52 @@ class StockAIAgentV4(StockAIAgentV3):
         prediction_info = "\n".join(predictions) + "\n\n모델 검증 결과:\n" + "\n".join(validation)
         return current, prediction_info
 
+    def _realized_t1_context(self, name):
+        """이미 저장된 개장 전 T+1 예측의 실제 방향 성과만 읽습니다."""
+        try:
+            with closing(connect_db(self.db_path, row_factory=True)) as conn:
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(analysis_log)")}
+                needed = {"name", "timestamp", "target_t1", "t1_actual_close",
+                          "last_close", "lstm_t1", "tabpfn_t1"}
+                if not needed <= columns:
+                    return "실제 T+1 방향 성과: 평가 기록 없음"
+                rows = conn.execute("""
+                    SELECT target_t1, last_close, t1_actual_close, lstm_t1, tabpfn_t1
+                    FROM analysis_log
+                    WHERE name=? AND target_t1 IS NOT NULL
+                      AND date(timestamp) < target_t1
+                      AND t1_actual_close IS NOT NULL
+                    ORDER BY target_t1 DESC, timestamp DESC, id DESC
+                """, (name,)).fetchall()
+        except Exception as exc:
+            print(f"      ⚠️ 실제 T+1 성과 조회 실패: {exc}")
+            return "실제 T+1 방향 성과: 조회 불가"
+        unique = {}
+        for row in rows:
+            unique.setdefault(row["target_t1"], row)
+            if len(unique) >= 30:
+                break
+        parts = []
+        for label, field in (("LSTM", "lstm_t1"), ("TabPFN", "tabpfn_t1")):
+            samples = [row for row in unique.values() if all(
+                isinstance(row[key], (int, float)) for key in
+                ("last_close", "t1_actual_close", field)
+            )]
+            if not samples:
+                parts.append(f"{label} 평가 0건")
+                continue
+            def direction(change):
+                return (change > 0) - (change < 0)
+            hits = sum(direction(row[field] - row["last_close"]) ==
+                       direction(row["t1_actual_close"] - row["last_close"]) for row in samples)
+            parts.append(f"{label} 방향 적중 {hits / len(samples):.0%} ({len(samples)}건)")
+        return "실제 사전 T+1 예측: " + ", ".join(parts) + ". 소표본은 참고용."
+
     def _discuss_stock(self, name, data):
         """각 답변은 다음 단계 전에 저장하며, 최종결정자에는 의견만 전달합니다."""
         current, prediction = self._stock_context(data)
+        if self.simulator.analysis_mode == "professional":
+            prediction += "\n" + self._realized_t1_context(name)
         news = self._news_context(data)
         run_id = uuid.uuid4().hex
 
@@ -363,22 +459,48 @@ class StockAIAgentV4(StockAIAgentV3):
         print(f"\n🔮 백테스트 데이터: 수익률 {data['bt_ret']:.2f}% | "
               f"Sharpe {data['sharpe']:.2f} | MDD {data['mdd']:.2f}%\n{'=' * 65}\n")
 
-    def run(self):
+    def run(self, name=None):
         """ML 분석 후 종목별 토론과 결과 출력을 진행합니다."""
+        if name is not None:
+            if name not in self.tickers:
+                raise ValueError(f"지원하지 않는 분석 종목: {name}")
+            self.tickers = {name: self.tickers[name]}
+        print(f"🧠 LLM 분석: {self.simulator.analysis_mode} "
+              f"({self.simulator.nvidia_model if self.simulator.analysis_mode == 'professional' else self.simulator.expert_model})")
         print("📅 예측 목표일은 종목별 마지막 확정 일봉과 거래소 달력을 사용합니다.")
         print("🤖 ML 분석 엔진 가동 중...")
-        for name, data in self.run_and_return().items():
+        ml_results = self.run_and_return()
+        if not ml_results:
+            raise RuntimeError("ML 분석 결과가 없어 LLM 분석을 시작하지 못했습니다.")
+        failures = []
+        for name, data in ml_results.items():
             try:
                 results = self._discuss_stock(name, data)
                 self._print_report(name, data, results)
+                if results["최종결정자"][1] is None:
+                    failures.append(name)
             except Exception as exc:
+                failures.append(name)
                 print(f"❌ {name} 분석 실패: {exc}")
                 traceback.print_exc()
+        if failures:
+            raise RuntimeError(f"최종 분석 실패: {', '.join(failures)}")
 
 # 단독 실행
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="종목별 LLM 분석")
+    parser.add_argument("--mode", choices=("simple", "professional"))
+    parser.add_argument("--name", help="분석할 종목명; 생략하면 등록된 종목 전체")
+    args = parser.parse_args()
+    if args.mode:
+        os.environ["LLM_ANALYSIS_MODE"] = args.mode
+    elif os.isatty(0):
+        choice = input("분석 선택 [1] 간단(gemma4:12b) [2] 전문(NVIDIA) (기본 1): ").strip()
+        if choice not in ("", "1", "2"):
+            parser.error("1 또는 2를 입력하세요.")
+        os.environ["LLM_ANALYSIS_MODE"] = "professional" if choice == "2" else "simple"
     agent = StockAIAgentV4()
-    agent.run()
+    agent.run(args.name)
     from cleanup_history import maintain_history
     maintain_history(agent.db_path)
