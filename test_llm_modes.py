@@ -46,7 +46,7 @@ class ModeTests(unittest.TestCase):
         self.assertIn('의견', answer)
         args = self.requests.post.call_args
         self.assertEqual(args.args[0], 'https://integrate.api.nvidia.com/v1/chat/completions')
-        self.assertEqual(args.kwargs['json']['model'], 'nvidia/nemotron-3-super-120b-a12b')
+        self.assertEqual(args.kwargs['json']['model'], 'nvidia/nemotron-3.5-super-vl-120b-a12b')
         self.assertIn('NEWS', args.kwargs['json']['messages'][1]['content'])
         self.assertNotIn('NEWS', args.kwargs['json']['messages'][0]['content'])
         self.assertEqual(args.kwargs['headers']['Authorization'], 'Bearer secret-test-value')

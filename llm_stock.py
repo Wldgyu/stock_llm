@@ -33,7 +33,7 @@ class MarketAgentSimulator:
         expert_model: str = "gemma4:12b",
         decision_model: str = "gemma4:12b",
         analysis_mode: str = "simple",
-        nvidia_model: str = "nvidia/nemotron-3-super-120b-a12b",
+        nvidia_model: str = "nvidia/nemotron-3.5-super-vl-120b-a12b",
     ):
         self.server_ip      = server_ip or os.environ.get("OLLAMA_HOST", "127.0.0.1")
         self.expert_model   = expert_model
@@ -255,7 +255,7 @@ class StockAIAgentV4(StockAIAgentV3):
             expert_model=os.environ.get("OLLAMA_EXPERT_MODEL", "gemma4:12b"),
             decision_model=os.environ.get("OLLAMA_DECISION_MODEL", "gemma4:12b"),
             analysis_mode=os.environ.get("LLM_ANALYSIS_MODE", "simple").lower(),
-            nvidia_model=os.environ.get("NVIDIA_MODEL", "nvidia/nemotron-3-super-120b-a12b"),
+            nvidia_model=os.environ.get("NVIDIA_MODEL", "nvidia/nemotron-3.5-super-vl-120b-a12b"),
         )
         self.pause_seconds = float(os.environ.get("OLLAMA_PAUSE_SECONDS", "15"))
         self._init_persona_db()
