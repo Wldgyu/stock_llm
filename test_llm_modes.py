@@ -36,6 +36,17 @@ class ModeTests(unittest.TestCase):
         self.assertEqual(sim._send_request.call_args.kwargs['model_name'], 'gemma4:12b')
         sim._send_nvidia_request.assert_not_called()
 
+    def test_local_request_uses_chat_roles_and_json_format(self):
+        sim = self.simulator(analysis_mode='simple')
+        self.requests.post.return_value = Mock(status_code=200,
+            json=lambda: {'message': {'content': '{"score": 0.2}'}})
+        self.assertIn('score', sim.run_news_expert('TEST', 'NEWS'))
+        request = self.requests.post.call_args_list[0]
+        self.assertTrue(request.args[0].endswith('/api/chat'))
+        self.assertEqual(request.kwargs['json']['format'], 'json')
+        self.assertEqual([item['role'] for item in request.kwargs['json']['messages']], ['system', 'user'])
+        self.assertIn('NEWS', request.kwargs['json']['messages'][1]['content'])
+
     def test_professional_uses_nvidia_without_key_logging(self):
         with patch.dict(os.environ, {'NVIDIA_TOKEN': 'secret-test-value'}):
             sim = self.simulator(analysis_mode='professional')
@@ -59,7 +70,8 @@ class ModeTests(unittest.TestCase):
     def test_saved_t1_metric_deduplicates_and_ignores_late_forecasts(self):
         agent_node = next(n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == 'StockAIAgentV4')
         namespace = {'StockAIAgentV3': object, 'DEFAULT_DB_PATH': '',
-                     'Optional': Optional, 'closing': closing}
+                     'Optional': Optional, 'closing': closing,
+                     'saved_before_open': lambda timestamp, utc, target, symbol: timestamp < target + ' 09:00'}
         def connect_db(path, row_factory=False):
             conn = sqlite3.connect(path)
             if row_factory:
@@ -72,17 +84,42 @@ class ModeTests(unittest.TestCase):
             with closing(sqlite3.connect(path)) as conn, conn:
                 conn.execute('CREATE TABLE analysis_log (id INTEGER PRIMARY KEY, name TEXT, '
                              'timestamp TEXT, target_t1 TEXT, t1_actual_close REAL, '
-                             'last_close REAL, lstm_t1 REAL, tabpfn_t1 REAL)')
-                conn.executemany('INSERT INTO analysis_log VALUES (?,?,?,?,?,?,?,?)', [
-                    (1, 'TEST', '2026-09-01 10:00', '2026-09-02', 110, 100, 105, 95),
-                    (2, 'TEST', '2026-09-01 11:00', '2026-09-02', 110, 100, 106, 94),
-                    (3, 'TEST', '2026-09-03 10:00', '2026-09-03', 110, 100, 95, 105),
+                             'last_close REAL, lstm_t1 REAL, tabpfn_t1 REAL, symbol TEXT)')
+                conn.executemany('INSERT INTO analysis_log VALUES (?,?,?,?,?,?,?,?,?)', [
+                    (1, 'TEST', '2026-09-01 10:00', '2026-09-02', 110, 100, 105, 95, 'TEST'),
+                    (2, 'TEST', '2026-09-02 08:00', '2026-09-02', 110, 100, 106, 94, 'TEST'),
+                    (3, 'TEST', '2026-09-02 09:00', '2026-09-02', 110, 100, 95, 105, 'TEST'),
                 ])
             agent = namespace['StockAIAgentV4'].__new__(namespace['StockAIAgentV4'])
             agent.db_path = path
             result = agent._realized_t1_context('TEST')
         self.assertIn('LSTM 방향 적중 100% (1건)', result)
         self.assertIn('TabPFN 방향 적중 0% (1건)', result)
+
+    def test_latest_preopen_pending_is_not_replaced_by_older_result(self):
+        agent_node = next(n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == 'StockAIAgentV4')
+        namespace = {'StockAIAgentV3': object, 'DEFAULT_DB_PATH': '', 'Optional': Optional,
+                     'closing': closing, 'saved_before_open': lambda *args: True}
+        def connect_db(path, row_factory=False):
+            conn = sqlite3.connect(path)
+            if row_factory:
+                conn.row_factory = sqlite3.Row
+            return conn
+        namespace['connect_db'] = connect_db
+        exec(compile(ast.Module(body=[agent_node], type_ignores=[]), 'agent', 'exec'), namespace)
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / 'history.db')
+            with closing(sqlite3.connect(path)) as conn, conn:
+                conn.execute('CREATE TABLE analysis_log (id INTEGER PRIMARY KEY, name TEXT, timestamp TEXT, '
+                             'target_t1 TEXT, t1_actual_close REAL, last_close REAL, lstm_t1 REAL, tabpfn_t1 REAL, symbol TEXT)')
+                conn.executemany('INSERT INTO analysis_log VALUES (?,?,?,?,?,?,?,?,?)', [
+                    (1, 'TEST', '2026-09-01 10:00', '2026-09-02', 110, 100, 105, 95, 'TEST'),
+                    (2, 'TEST', '2026-09-02 08:00', '2026-09-02', None, 100, 95, 105, 'TEST'),
+                ])
+            agent = namespace['StockAIAgentV4'].__new__(namespace['StockAIAgentV4'])
+            agent.db_path = path
+            result = agent._realized_t1_context('TEST')
+        self.assertIn('LSTM 평가 0건', result)
 
 
 if __name__ == '__main__':

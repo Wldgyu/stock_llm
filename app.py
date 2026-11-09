@@ -294,9 +294,15 @@ def _latest_persona_map(connection):
     columns = {row[1] for row in connection.execute("PRAGMA table_info(persona_discussion_log)")}
     if "analysis_id" not in columns:
         return {}  # 기존 기록은 ML과의 연결을 추측하지 않습니다.
+    status_column = "p.analysis_status" if "analysis_status" in columns else "NULL"
+    role_count = ("(SELECT COUNT(DISTINCT q.persona) FROM persona_discussion_log q "
+                  "WHERE q.analysis_id=p.analysis_id AND q.run_id=p.run_id "
+                  "AND q.persona IN ('주식전문가', '뉴스기업전문가', '최종결정자') AND q.score IS NOT NULL)"
+                  if "run_id" in columns else "NULL")
     rows = connection.execute(
-        """
-        SELECT p.ticker_name, p.score, p.opinion, p.timestamp
+        f"""
+        SELECT p.ticker_name, p.score, p.opinion, p.timestamp, {status_column} AS analysis_status,
+               {role_count} AS successful_roles
         FROM persona_discussion_log p
         JOIN (SELECT name, MAX(id) AS id FROM analysis_log GROUP BY name) a
           ON p.analysis_id=a.id AND p.ticker_name=a.name
@@ -311,6 +317,8 @@ def _latest_persona_map(connection):
             "score": row["score"],
             "opinion": row["opinion"] or "",
             "timestamp": row["timestamp"],
+            "analysis_status": row["analysis_status"] or ("failed" if row["score"] is None else
+                "partial" if row["successful_roles"] is not None and row["successful_roles"] < 3 else "complete"),
         }
         for row in rows
     }
@@ -422,7 +430,7 @@ def _stock_payload(name, analysis=None, persona=None):
         "model_validation": _model_validation_payload(analysis),
         "risk_score": analysis.get("risk_score"),
         "analysis_id": analysis.get("id"),
-        "llm_status": ("failed" if persona.get("score") is None else "complete") if persona else "unavailable",
+        "llm_status": (persona.get("analysis_status") or ("failed" if persona.get("score") is None else "complete")) if persona else "unavailable",
         "final_score": persona.get("score"),
         "final_opinion": persona.get("opinion", "")[:200],
         "source": "+".join(source_parts) or "none",
@@ -708,7 +716,17 @@ def api_stock_ai(name):
             )
 
         final = next((item for item in personas if item["persona"] == "최종결정자"), None)
-        return jsonify({"name": name, "personas": personas, "final": final})
+        final_row = next((dict(row) for row in rows if row["persona"] == "최종결정자"), {})
+        complete_roles = {item["persona"] for item in personas if item["score"] is not None}
+        status = final_row.get("analysis_status") or ("failed" if not final or final["score"] is None else
+                 "partial" if not {"주식전문가", "뉴스기업전문가", "최종결정자"} <= complete_roles else "complete")
+        try:
+            sources = json.loads(analysis.get("news_sources_json") or "[]")
+            if not isinstance(sources, list):
+                sources = []
+        except (TypeError, ValueError):
+            sources = []
+        return jsonify({"name": name, "personas": personas, "final": final, "status": status, "news_sources": sources})
     finally:
         connection.close()
 
@@ -732,10 +750,18 @@ def _run_analysis_job(name, mode):
                         if not message.startswith("Traceback"):
                             _analysis_job["message"] = message[:200]
             code = process.wait()
+        status = "complete" if code == 0 else "failed"
+        message = "분석 완료" if code == 0 else f"분석 프로세스 종료 코드 {code}; 서버 로그를 확인하세요."
+        if code == 0:
+            connection = get_connection()
+            try:
+                if _latest_persona_map(connection).get(name, {}).get("analysis_status") == "partial":
+                    status, message = "partial", "일부 전문가 분석 실패 · 결과 확인 필요"
+            finally:
+                connection.close()
         with _analysis_job_lock:
-            _analysis_job["status"] = "complete" if code == 0 else "failed"
-            _analysis_job["message"] = ("분석 완료" if code == 0 else
-                                          f"분석 프로세스 종료 코드 {code}; 서버 로그를 확인하세요.")
+            _analysis_job["status"] = status
+            _analysis_job["message"] = message
     except Exception as exc:
         with _analysis_job_lock:
             _analysis_job["status"] = "failed"

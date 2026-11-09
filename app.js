@@ -155,7 +155,7 @@ function renderStockCard(stock, index) {
           <strong class="metric-value" style="color:${rsiColor}">${formatNumber(stock.rsi, 1)}</strong>
         </div>
         <div class="metric-item">
-          <span class="metric-label">AI 점수</span>
+          <span class="metric-label">AI 점수${stock.llm_status === "partial" ? " · 일부 분석 실패" : ""}</span>
           <strong class="metric-value" style="color:${scoreColor(stock.final_score)}">${finalScore}</strong>
         </div>
       </div>
@@ -423,9 +423,10 @@ function renderModelValidation(payload, currency) {
           <article class="validation-card ${warning ? "warning" : "passed"}">
             <div class="validation-card-header">
               <strong>${label}</strong>
-              <span>${warning ? "기준 미달" : "naive 통과"}</span>
+              <span>${warning ? "전체·fold 기준 미달" : "전체·fold 기준 통과"}</span>
             </div>
             ${warning ? `<p class="validation-warning">⚠️ ${escapeHtml(warning)}</p>` : ""}
+            <p>전체 기간 평균 · 기간별 검증 ${metrics.test_samples ?? ((metrics.folds || []).reduce((sum, item) => sum + (item.samples?.test || 0), 0) || "—")}건</p>
             <div class="validation-metrics">
               <span><small>MAE</small><b>${formatPrice(test.mae, currency)}</b></span>
               <span><small>RMSE</small><b>${formatPrice(test.rmse, currency)}</b></span>
@@ -433,6 +434,15 @@ function renderModelValidation(payload, currency) {
               <span><small>방향 정확도</small><b>${formatPercent(test.direction_accuracy)}</b></span>
               <span><small>naive 대비 MAE</small><b>${formatSignedPercent(comparison.mae_improvement_pct)}</b></span>
               <span><small>naive MAE</small><b>${formatPrice(naive.mae, currency)}</b></span>
+            </div>
+            <div class="fold-summary">
+              <strong>예측 기간별 성능</strong>
+              ${["T+1", "T+4", "T+7"].map((horizon) => {
+                const result = test.by_horizon?.[horizon] || {};
+                const base = naive.by_horizon?.[horizon] || {};
+                const verdict = isNumber(result.mae) && isNumber(base.mae) ? (Number(result.mae) < Number(base.mae) ? "기준 대비 개선" : "기준 미달 또는 동일") : "비교 불가";
+                return `<span>${horizon}: MAE ${formatPrice(result.mae, currency)} · naive ${formatPrice(base.mae, currency)} · 방향 ${formatPercent(result.direction_accuracy)} · ${verdict}</span>`;
+              }).join("")}
             </div>
             ${metrics.strategy_backtest ? `
               <div class="fold-summary">
@@ -702,7 +712,8 @@ async function updateAnalysisJob() {
     $("ai-run-status").textContent = running
       ? `${job.name} ${job.mode === "professional" ? "전문" : "간단"} 분석 중 · ${job.message}`
       : job.status === "failed" ? `분석 실패 · ${job.message}`
-      : job.status === "complete" ? `${job.name} 분석 완료` : "";
+      : job.status === "complete" ? `${job.name} 분석 완료`
+      : job.status === "partial" ? `${job.name} 일부 분석 실패 · 결과 확인 필요` : "";
     if (running && !state.analysisTimer) {
       state.analysisTimer = setInterval(updateAnalysisJob, 3000);
     } else if (!running && state.analysisTimer) {
@@ -756,11 +767,12 @@ async function openAiPanel() {
     const order = ["주식전문가", "뉴스기업전문가", "최종결정자"];
     const personas = order.map((name) => data.personas.find((item) => item.persona === name)).filter(Boolean);
     const final = data.final;
+    const statusLabel = { complete: "정상", partial: "일부 분석 실패 · 결과 해석 주의", failed: "최종 분석 실패" }[data.status] || "상태 확인 불가";
     const summary = final ? `
       <div class="final-decision-summary">
         <strong class="final-summary-score" style="color:${scoreColor(final.score)}">${final.score == null ? "오류" : `${Number(final.score) >= 0 ? "+" : ""}${Number(final.score).toFixed(2)}`}</strong>
         <div class="final-summary-info">
-          <span class="final-summary-label">최종 판단</span>
+          <span class="final-summary-label">최종 판단 · ${statusLabel}</span>
           <strong class="final-summary-verdict" style="color:${scoreColor(final.score)}">${scoreLabel(final.score)}</strong>
         </div>
         <p class="final-summary-opinion">${escapeHtml(final.opinion || "")}</p>
@@ -788,7 +800,15 @@ async function openAiPanel() {
           <p class="persona-opinion">${escapeHtml(persona.opinion || "의견 없음")}</p>
         </article>`;
     }).join("");
-    content.innerHTML = summary + `<div class="ai-personas-grid">${cards}</div>`;
+    const sources = (data.news_sources || []).map((source) => {
+      let link = "";
+      try {
+        const url = new URL(source.url);
+        if (["http:", "https:"].includes(url.protocol)) link = `<a href="${escapeHtml(url.href)}" target="_blank" rel="noopener noreferrer">원문</a>`;
+      } catch { /* URL이 없는 제목 자료도 표시합니다. */ }
+      return `<p>${escapeHtml(source.id)} · ${escapeHtml(source.source || "미확인")} · ${escapeHtml(source.published || "날짜 미확인")} · ${escapeHtml(source.title || "")} ${link}</p>`;
+    }).join("");
+    content.innerHTML = summary + `<div class="ai-personas-grid">${cards}</div>` + (sources ? `<div class="fold-summary"><strong>수집 기사 출처</strong>${sources}</div>` : "");
   } catch (error) {
     content.innerHTML = `<div class="empty-state"><h3>AI 분석 없음</h3><p>${escapeHtml(error.message)}</p></div>`;
   }

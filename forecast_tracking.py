@@ -2,7 +2,7 @@
 from datetime import datetime
 import pandas as pd
 import yfinance as yf
-from trading_dates import calendar_for, completed_bars
+from trading_dates import calendar_for, completed_bars, saved_before_open
 
 
 def t1_history(connection, name, unique_targets=False):
@@ -28,9 +28,11 @@ def t1_history(connection, name, unique_targets=False):
             if schedule.empty:
                 status='invalid_date'
             else:
-                # Existing timestamps are generated in the application's Seoul local timezone.
-                saved=pd.Timestamp(row['timestamp']).tz_localize('Asia/Seoul').tz_convert('UTC')
-                if saved>=schedule['market_open'].iloc[0]:
+                pre_open=saved_before_open(row.get('timestamp'), row.get('timestamp_utc'), target, symbol,
+                                           market_open=schedule['market_open'].iloc[0])
+                if pre_open is None:
+                    status='invalid_date'
+                elif not pre_open:
                     status='late'
                 elif row.get('t1_actual_close') is not None:
                     status='complete'

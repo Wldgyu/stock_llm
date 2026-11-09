@@ -11,7 +11,7 @@ ml_stock.py
 """
 
 from contextlib import closing
-from datetime import datetime, time as clock_time, timedelta
+from datetime import datetime, time as clock_time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import warnings
@@ -215,6 +215,8 @@ class StockAIAgentV3:
             # 기존 DB에도 모델별 예측과 검증 결과 컬럼을 자동으로 추가합니다.
             new_columns = {
                 "data_date": "TEXT",
+                "timestamp_utc": "TEXT",
+                "news_sources_json": "TEXT",
                 "target_t1": "TEXT",
                 "target_t4": "TEXT",
                 "target_t7": "TEXT",
@@ -249,8 +251,9 @@ class StockAIAgentV3:
         volatility = float(df["Close"].pct_change().std() * np.sqrt(252) * 100)
         risk_score = min(10, max(1, int(round(volatility / 5))))
 
+        saved_at = datetime.now(timezone.utc)
         values = (
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            saved_at.astimezone(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S"),
             name,
             result["symbol"],
             float(df["Close"].iloc[-1]),
@@ -275,6 +278,8 @@ class StockAIAgentV3:
             if result.get("tabpfn_metrics") is not None else None,
             risk_score,
             result["data_date"], result["target_t1"], result["target_t4"], result["target_t7"],
+            saved_at.isoformat(),
+            json.dumps(result.get("news_sources", []), ensure_ascii=False),
         )
         with closing(connect_db(self.db_path)) as conn, conn:
             cursor = conn.execute("""
@@ -285,10 +290,10 @@ class StockAIAgentV3:
                     lstm_t1, lstm_t4, lstm_t7,
                     tabpfn_t1, tabpfn_t4, tabpfn_t7,
                     lstm_metrics_json, tabpfn_metrics_json, risk_score,
-                    data_date, target_t1, target_t4, target_t7
+                    data_date, target_t1, target_t4, target_t7, timestamp_utc, news_sources_json
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
             """, values)
             result["analysis_id"] = cursor.lastrowid
@@ -306,6 +311,15 @@ class StockAIAgentV3:
         sharpe, mdd    = self.calculate_performance_metrics(equity)
         titles = self.get_news_titles(name)
         news_articles = self.get_financial_news_articles(name, symbol)
+        news_sources = [
+            {"id": f"N{i}", **{key: article.get(key, "") for key in
+             ("title", "source", "published", "url", "content_type")}}
+            for i, article in enumerate(news_articles, 1)
+        ]
+        if not news_sources:
+            news_sources = [{"id": f"N{i}", "title": title, "source": "미확인",
+                             "published": "", "url": "", "content_type": "제목"}
+                            for i, title in enumerate(titles[:3], 1)]
         preds, model, last_seq, baseline_seq, lstm_metrics = self.predict_multi_step(df)
         tabpfn_preds, tabpfn_metrics = self.predict_tabpfn(df)
         model_metrics = {"lstm": lstm_metrics}
@@ -331,6 +345,7 @@ class StockAIAgentV3:
             "mdd": mdd,
             "titles": titles,
             "news_articles": news_articles,
+            "news_sources": news_sources,
             "preds": preds,
             "tabpfn_preds": tabpfn_preds,
             "lstm_metrics": lstm_metrics,
@@ -522,6 +537,8 @@ class StockAIAgentV3:
                                 if description:
                                     body = description
                                     content_type = "기사 요약"
+                                else:
+                                    body = ""
                 except Exception as exc:
                     print(f"      ⚠️ {display_source} 본문 수집 실패: {exc}")
 
@@ -829,6 +846,7 @@ class StockAIAgentV3:
         metrics.update({
             "test": test_metrics,
             "naive_baseline": naive_metrics,
+            "test_samples": len(test_true_all),
             "comparison": self._compare_with_naive(test_metrics, naive_metrics),
             "fold_summary": self._summarize_fold_metrics(fold_results),
         })
@@ -1295,6 +1313,13 @@ class StockAIAgentV3:
         )
         naive = metrics["naive_baseline"]
         compare = metrics["comparison"]
+        print(f"   📊 기간별 검증 표본: {metrics.get('test_samples', '확인 불가')}건")
+        for horizon in ("T+1", "T+4", "T+7"):
+            model_result = test["by_horizon"][horizon]
+            baseline = naive["by_horizon"][horizon]
+            verdict = "기준 대비 개선" if model_result["mae"] < baseline["mae"] else "기준 미달 또는 동일"
+            print(f"      {horizon}: MAE {model_result['mae']:,.2f} / naive {baseline['mae']:,.2f} | "
+                  f"방향 {model_result['direction_accuracy']:.2f}% | {verdict}")
         print(
             f"   📏 3-fold naive 기준: MAE {naive['mae']:,.2f} | "
             f"개선율 {compare['mae_improvement_pct']:+.2f}% | "

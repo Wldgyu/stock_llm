@@ -124,8 +124,10 @@ def show_final_summary():
             print("⚠️  persona_discussion_log 테이블이 없습니다.")
             return
 
-        query = """
-            SELECT ticker_name, timestamp, score, opinion
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(persona_discussion_log)")}
+        status_column = "analysis_status" if "analysis_status" in columns else "NULL AS analysis_status"
+        query = f"""
+            SELECT ticker_name, timestamp, score, opinion, {status_column}
             FROM persona_discussion_log
             WHERE persona = '최종결정자'
             ORDER BY id DESC
@@ -153,6 +155,8 @@ def show_final_summary():
             print(f"\n📌 [{row['ticker_name']}]  |  {row['timestamp']}")
             score_text = f"{score:+.2f}" if score is not None else "없음"
             print(f"   최종 점수: {score_text}  →  {emoji}")
+            if row['analysis_status'] == 'partial':
+                print("   ⚠️ 일부 전문가 분석 실패: 결과 해석에 주의하세요.")
             print(f"   의견 요약: {str(row['opinion'])[:120]}...")
 
     finally:

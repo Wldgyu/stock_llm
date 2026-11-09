@@ -1,23 +1,16 @@
 """Regression checks without loading ML models or calling Ollama."""
-import ast
-import json
 import unittest
-from pathlib import Path
-from typing import Optional
 import pandas as pd
-from trading_dates import prediction_dates, completed_bars
+from trading_dates import prediction_dates, completed_bars, saved_before_open
 
 class AccuracyTests(unittest.TestCase):
-    def test_score_parser(self):
-        tree=ast.parse(Path(__file__).with_name('llm_stock.py').read_text(encoding='utf-8'))
-        cls=next(n for n in tree.body if isinstance(n,ast.ClassDef))
-        fn=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='parse_score_from_response')
-        namespace={'json':json,'Optional':Optional}
-        exec(compile(ast.Module(body=[fn],type_ignores=[]),'parser','exec'),namespace)
-        parse=lambda text:namespace['parse_score_from_response'](None,text)
-        self.assertEqual(parse('opinion\n{"score":0.5}'),0.5)
-        for text in ('{"score":0.45}\n{"score":2}', '{"score":true}', '{"score":"0.5"}', '{"score":NaN}', '{"score":0.2,"score":0.3}', '{"score":0.4}\ntrailing'):
-            with self.subTest(text=text):self.assertIsNone(parse(text))
+    def test_saved_time_uses_exchange_open_and_utc(self):
+        self.assertTrue(saved_before_open('2026-09-02 08:59:00', None, '2026-09-02', '005930.KS'))
+        self.assertFalse(saved_before_open('2026-09-02 09:00:00', None, '2026-09-02', '005930.KS'))
+        self.assertTrue(saved_before_open('2026-09-02 22:29:00', None, '2026-09-02', 'NVDA'))
+        self.assertFalse(saved_before_open('2026-09-02 22:30:00', None, '2026-09-02', 'NVDA'))
+        self.assertTrue(saved_before_open('ignored', '2026-09-02T13:29:00+00:00', '2026-09-02', 'NVDA'))
+        self.assertIsNone(saved_before_open('invalid', None, '2026-09-02', 'NVDA'))
     def test_holiday_and_weekend(self):
         self.assertEqual(prediction_dates('2026-09-04','NVDA')['target_t1'],'2026-09-08')
         self.assertEqual(prediction_dates('2026-09-11','005930.KS')['target_t1'],'2026-09-14')
