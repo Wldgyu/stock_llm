@@ -14,6 +14,23 @@ import pandas as pd
 
 
 class AnalysisStorageTests(unittest.TestCase):
+    def test_run_and_return_records_per_stock_failures(self):
+        tree = ast.parse(Path(__file__).with_name('ml_stock.py').read_text(encoding='utf-8'))
+        agent = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'StockAIAgentV3')
+        method = next(node for node in agent.body if isinstance(node, ast.FunctionDef) and node.name == 'run_and_return')
+        namespace = {'traceback': __import__('traceback')}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), 'runner', 'exec'), namespace)
+        class FakeAgent:
+            tickers = {'good': 'GOOD', 'stale': 'OLD', 'empty': 'EMPTY'}
+            run_and_return = namespace['run_and_return']
+            def _analyze_stock(self, name, symbol):
+                if name == 'stale':
+                    raise ValueError('목표일 개장됨')
+                return {'symbol': symbol} if name == 'good' else None
+        agent = FakeAgent()
+        self.assertEqual(agent.run_and_return(), {'good': {'symbol': 'GOOD'}})
+        self.assertEqual(set(agent.analysis_failures), {'stale', 'empty'})
+
     def test_existing_table_migrates_and_saves_utc_and_sources(self):
         tree = ast.parse(Path(__file__).with_name('ml_stock.py').read_text(encoding='utf-8'))
         agent = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'StockAIAgentV3')

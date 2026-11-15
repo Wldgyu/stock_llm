@@ -448,7 +448,8 @@ function renderModelValidation(payload, currency) {
               <div class="fold-summary">
                 <strong>동일 기간 전략 백테스트 · 비용 차감</strong>
                 <span>${escapeHtml(metrics.strategy_backtest.start)} ~ ${escapeHtml(metrics.strategy_backtest.end)}</span>
-                <span>T+1 · 다음 시가 체결 · 매수/현금 · 편도 수수료 ${formatNumber(metrics.strategy_backtest.fee_bps_per_side, 0)}bp + 슬리피지 ${formatNumber(metrics.strategy_backtest.slippage_bps_per_side, 0)}bp · 세금 제외</span>
+                <span>T+1 예측 기반 포지션 유지 · 다음 시가 체결 · 매수/현금 · 편도 수수료 ${formatNumber(metrics.strategy_backtest.fee_bps_per_side, 0)}bp + 슬리피지 ${formatNumber(metrics.strategy_backtest.slippage_bps_per_side, 0)}bp · 세금 제외</span>
+                <span>보유 중 야간 가격 변동도 수익률에 포함됩니다. 예측 정확도와 전략 수익은 다릅니다.</span>
                 ${Object.entries(metrics.strategy_backtest.strategies).map(([name, result]) => `<span>${escapeHtml(name)}: 수익률 ${formatSignedPercent(result.return_pct)} · Sharpe ${formatNumber(result.sharpe, 2)} · MDD ${formatPercent(result.mdd_pct)} · 주문 ${result.orders}회</span>`).join("")}
               </div>` : ""}
             <div class="fold-summary">

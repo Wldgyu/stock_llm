@@ -43,7 +43,7 @@ from sklearn.preprocessing import StandardScaler
 
 from database import DB_PATH, connect_db
 from backtesting import compare_strategies
-from trading_dates import prediction_dates, completed_bars
+from trading_dates import prediction_dates, completed_bars, forecast_validity, calendar_for, local_date
 from news_selection import COMPANIES, select_news
 
 # ── TabPFN / HuggingFace 인증 자동 로드 ──────────────────────
@@ -305,6 +305,11 @@ class StockAIAgentV3:
             print(f"⚠️ {name}: 데이터 부족, 건너뜁니다.")
             return None
 
+        dates = prediction_dates(df.index[-1], symbol)
+        valid, reason = forecast_validity(dates['data_date'], dates['target_t1'], symbol)
+        if not valid:
+            raise ValueError(f'예측 학습 중단: {reason}')
+
         df["RSI"] = ta.rsi(df["Close"], length=14)
         print(f"📅 [{name}] 최신 확정 일봉: {df.index[-1].date()} | 수집 {len(df)}거래일")
         bt_ret, equity = self.backtest(df)
@@ -332,12 +337,12 @@ class StockAIAgentV3:
         for value in model_metrics.values():
             value["strategy_backtest"] = comparison
         print(f"📊 OOS 전략 비교 {comparison['start']} ~ {comparison['end']} (비용 차감)")
-        print("   ℹ️ T+1·T+4·T+7 정답이 모두 있는 공통 OOS 표본 기준: 최근 6거래일은 제외됩니다. 최신 예측 기준일과 다릅니다.")
+        print("   ℹ️ T+7 정답이 필요한 공통 OOS 표본 기준: 각 fold 경계와 최근 6거래일의 일부 신호가 제외됩니다.")
         for key, value in comparison["strategies"].items():
             print(f"  {key}: 수익률 {value['return_pct']:.2f}% | Sharpe {value['sharpe']:.2f} | MDD {value['mdd_pct']:.2f}% | 주문 {value['orders']}회")
 
         result = {
-            **prediction_dates(df.index[-1], symbol),
+            **dates,
             "df": df,
             "symbol": symbol,
             "bt_ret": bt_ret,
@@ -354,6 +359,9 @@ class StockAIAgentV3:
             "l_seq": last_seq,
             "baseline_seq": baseline_seq,
         }
+        valid, reason = forecast_validity(result['data_date'], result['target_t1'], symbol)
+        if not valid:
+            raise ValueError(f'예측 저장 중단: {reason}')
         self._save_analysis_result(name, result)
         print(f"✅ [{name}] ML 분석 및 DB 저장 완료.")
         return result
@@ -380,6 +388,17 @@ class StockAIAgentV3:
             close_timestamps.append(local_close.astimezone(utc))
         return pd.to_datetime(close_timestamps, utc=True)
 
+    @staticmethod
+    def _session_close_times_utc(index, symbol: str):
+        """거래소 달력의 실제 정규장 마감 시각을 사용합니다."""
+        if len(index) == 0:
+            return pd.DatetimeIndex([], tz='UTC')
+        calendar = calendar_for(symbol)
+        dates = [local_date(value, calendar) for value in index]
+        schedule = calendar.schedule(start_date=min(dates), end_date=max(dates))
+        closes = {stamp.date(): value for stamp, value in schedule['market_close'].items()}
+        return pd.to_datetime([closes.get(day, pd.NaT) for day in dates], utc=True)
+
     @classmethod
     def _merge_confirmed_macro(
         cls,
@@ -389,21 +408,16 @@ class StockAIAgentV3:
         macro_name: str,
     ) -> pd.Series:
         """주가 마감 전에 확정된 가장 최신 거시지표만 결합합니다."""
-        is_korean = stock_symbol.endswith((".KS", ".KQ"))
-        stock_timezone = "Asia/Seoul" if is_korean else "America/New_York"
-        stock_close = clock_time(15, 30) if is_korean else clock_time(16, 0)
         macro_rules = {
             "USD_KRW": ("America/New_York", clock_time(17, 0)),
             "SOX_Index": ("America/New_York", clock_time(16, 0)),
         }
         macro_timezone, macro_close = macro_rules[macro_name]
 
-        stock_times = cls._close_times_utc(
-            stock_df.index, stock_timezone, stock_close
-        )
-        macro_times = cls._close_times_utc(
-            macro_series.index, macro_timezone, macro_close
-        )
+        stock_times = cls._session_close_times_utc(stock_df.index, stock_symbol)
+        macro_times = (cls._session_close_times_utc(macro_series.index, 'NVDA')
+                       if macro_name == 'SOX_Index' else
+                       cls._close_times_utc(macro_series.index, macro_timezone, macro_close))
         left = pd.DataFrame({
             "_stock_row": np.arange(len(stock_df)),
             "_confirmed_at": stock_times,
@@ -413,7 +427,7 @@ class StockAIAgentV3:
             macro_name: pd.to_numeric(macro_series, errors="coerce").to_numpy(),
         })
         right = (
-            right.dropna(subset=[macro_name])
+            right.dropna(subset=['_confirmed_at', macro_name])
             .drop_duplicates("_confirmed_at", keep="last")
             .sort_values("_confirmed_at")
         )
@@ -1423,12 +1437,16 @@ class StockAIAgentV3:
             }
         """
         results = {}
+        self.analysis_failures = {}
         for name, symbol in self.tickers.items():
             try:
                 result = self._analyze_stock(name, symbol)
                 if result:
                     results[name] = result
+                else:
+                    self.analysis_failures[name] = '분석 데이터 부족'
             except Exception as e:
+                self.analysis_failures[name] = str(e)
                 print(f"❌ {name} ML 분석 실패: {e}")
                 traceback.print_exc()
 

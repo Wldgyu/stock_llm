@@ -39,6 +39,30 @@ def saved_before_open(timestamp, timestamp_utc, target_date, symbol, market_open
     except (TypeError, ValueError, OverflowError):
         return None
 
+
+def forecast_validity(data_date, target_date, symbol, now=None):
+    """Require the latest completed session and a forecast made before target open."""
+    now = pd.Timestamp.now(tz='UTC') if now is None else pd.Timestamp(now)
+    if now.tzinfo is None:
+        raise ValueError('now must include timezone')
+    now = now.tz_convert('UTC')
+    calendar = calendar_for(symbol)
+    local_day = now.tz_convert(calendar.tz).date()
+    schedule = calendar.schedule(start_date=pd.Timestamp(local_day) - pd.Timedelta(days=60),
+                                 end_date=pd.Timestamp(local_day) + pd.Timedelta(days=30))
+    completed = schedule[schedule['market_close'] <= now]
+    if completed.empty:
+        return False, '최근 확정 거래일을 확인할 수 없습니다.'
+    latest = str(completed.index[-1].date())
+    if str(data_date) != latest:
+        return False, f'기준 일봉 {data_date}이 최신 확정 거래일 {latest}과 다릅니다.'
+    future = schedule[schedule.index > completed.index[-1]]
+    if future.empty or str(future.index[0].date()) != str(target_date):
+        return False, 'T+1 목표일이 다음 거래일과 일치하지 않습니다.'
+    if now >= future['market_open'].iloc[0]:
+        return False, f'T+1 목표일 {target_date}의 장이 이미 시작됐습니다.'
+    return True, '최신 확정 일봉 기준, T+1 개장 전'
+
 def completed_bars(frame,symbol,now=None):
     if frame.empty:
         return frame

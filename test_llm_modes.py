@@ -4,14 +4,17 @@ from contextlib import closing
 import json
 import math
 import os
+import re
 from pathlib import Path
 import sqlite3
 import tempfile
 import time
 import types
 import unittest
+import pandas as pd
 from typing import Optional
 from unittest.mock import Mock, patch
+import forecast_tracking
 
 
 TREE = ast.parse(Path(__file__).with_name('llm_stock.py').read_text(encoding='utf-8'))
@@ -23,7 +26,7 @@ class ModeTests(unittest.TestCase):
         self.requests = types.SimpleNamespace(
             post=Mock(), exceptions=types.SimpleNamespace(RequestException=Exception))
         namespace = {'os': os, 'math': math, 'Optional': Optional,
-                     'requests': self.requests, 'time': time, 'json': json}
+                     'requests': self.requests, 'time': time, 'json': json, 're': re}
         exec(compile(ast.Module(body=[simulator], type_ignores=[]), 'simulator', 'exec'), namespace)
         self.simulator = namespace['MarketAgentSimulator']
 
@@ -71,7 +74,7 @@ class ModeTests(unittest.TestCase):
         agent_node = next(n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == 'StockAIAgentV4')
         namespace = {'StockAIAgentV3': object, 'DEFAULT_DB_PATH': '',
                      'Optional': Optional, 'closing': closing,
-                     'saved_before_open': lambda timestamp, utc, target, symbol: timestamp < target + ' 09:00'}
+                     'math': math, 't1_history': forecast_tracking.t1_history}
         def connect_db(path, row_factory=False):
             conn = sqlite3.connect(path)
             if row_factory:
@@ -84,22 +87,24 @@ class ModeTests(unittest.TestCase):
             with closing(sqlite3.connect(path)) as conn, conn:
                 conn.execute('CREATE TABLE analysis_log (id INTEGER PRIMARY KEY, name TEXT, '
                              'timestamp TEXT, target_t1 TEXT, t1_actual_close REAL, '
-                             'last_close REAL, lstm_t1 REAL, tabpfn_t1 REAL, symbol TEXT)')
-                conn.executemany('INSERT INTO analysis_log VALUES (?,?,?,?,?,?,?,?,?)', [
-                    (1, 'TEST', '2026-09-01 10:00', '2026-09-02', 110, 100, 105, 95, 'TEST'),
-                    (2, 'TEST', '2026-09-02 08:00', '2026-09-02', 110, 100, 106, 94, 'TEST'),
-                    (3, 'TEST', '2026-09-02 09:00', '2026-09-02', 110, 100, 95, 105, 'TEST'),
+                             'last_close REAL, lstm_t1 REAL, tabpfn_t1 REAL, symbol TEXT, data_date TEXT)')
+                conn.executemany('INSERT INTO analysis_log VALUES (?,?,?,?,?,?,?,?,?,?)', [
+                    (1, 'TEST', '2026-09-01 10:00', '2026-09-02', 110, 100, 105, 95, 'TEST', '2026-09-01'),
+                    (2, 'TEST', '2026-09-02 08:00', '2026-09-02', 110, 100, 106, 94, 'TEST', '2026-09-01'),
+                    (3, 'TEST', '2026-09-02 09:00', '2026-09-02', 110, 100, 95, 105, 'TEST', '2026-09-01'),
                 ])
             agent = namespace['StockAIAgentV4'].__new__(namespace['StockAIAgentV4'])
             agent.db_path = path
-            result = agent._realized_t1_context('TEST')
+            with patch.object(forecast_tracking, 'saved_before_open',
+                              side_effect=lambda timestamp, utc, target, symbol, **kw: timestamp < target + ' 09:00'):
+                result = agent._realized_t1_context('TEST')
         self.assertIn('LSTM 방향 적중 100% (1건)', result)
         self.assertIn('TabPFN 방향 적중 0% (1건)', result)
 
     def test_latest_preopen_pending_is_not_replaced_by_older_result(self):
         agent_node = next(n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == 'StockAIAgentV4')
         namespace = {'StockAIAgentV3': object, 'DEFAULT_DB_PATH': '', 'Optional': Optional,
-                     'closing': closing, 'saved_before_open': lambda *args: True}
+                     'closing': closing, 'math': math, 't1_history': forecast_tracking.t1_history}
         def connect_db(path, row_factory=False):
             conn = sqlite3.connect(path)
             if row_factory:
@@ -111,15 +116,38 @@ class ModeTests(unittest.TestCase):
             path = str(Path(directory) / 'history.db')
             with closing(sqlite3.connect(path)) as conn, conn:
                 conn.execute('CREATE TABLE analysis_log (id INTEGER PRIMARY KEY, name TEXT, timestamp TEXT, '
-                             'target_t1 TEXT, t1_actual_close REAL, last_close REAL, lstm_t1 REAL, tabpfn_t1 REAL, symbol TEXT)')
-                conn.executemany('INSERT INTO analysis_log VALUES (?,?,?,?,?,?,?,?,?)', [
-                    (1, 'TEST', '2026-09-01 10:00', '2026-09-02', 110, 100, 105, 95, 'TEST'),
-                    (2, 'TEST', '2026-09-02 08:00', '2026-09-02', None, 100, 95, 105, 'TEST'),
+                             'target_t1 TEXT, t1_actual_close REAL, last_close REAL, lstm_t1 REAL, tabpfn_t1 REAL, symbol TEXT, data_date TEXT)')
+                conn.executemany('INSERT INTO analysis_log VALUES (?,?,?,?,?,?,?,?,?,?)', [
+                    (1, 'TEST', '2026-09-01 10:00', '2026-09-02', 110, 100, 105, 95, 'TEST', '2026-09-01'),
+                    (2, 'TEST', '2026-09-02 08:00', '2026-09-02', None, 100, 95, 105, 'TEST', '2026-09-01'),
                 ])
             agent = namespace['StockAIAgentV4'].__new__(namespace['StockAIAgentV4'])
             agent.db_path = path
-            result = agent._realized_t1_context('TEST')
+            with patch.object(forecast_tracking, 'saved_before_open', return_value=True), \
+                 patch.object(forecast_tracking.yf, 'Ticker', side_effect=RuntimeError('offline')):
+                result = agent._realized_t1_context('TEST')
         self.assertIn('LSTM 평가 0건', result)
+        self.assertIn('조회 실패 1건', result)
+
+    def test_history_refreshes_and_saves_evaluated_close(self):
+        with sqlite3.connect(':memory:') as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute('CREATE TABLE analysis_log (id INTEGER PRIMARY KEY, name TEXT, timestamp TEXT, '
+                         'timestamp_utc TEXT, target_t1 TEXT, last_close REAL, lstm_t1 REAL, '
+                         'tabpfn_t1 REAL, symbol TEXT, data_date TEXT)')
+            conn.execute('INSERT INTO analysis_log VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                         ('TEST', '2026-09-01 10:00', None, '2026-09-02', 100., 110., 90., 'NVDA', '2026-09-01'))
+            frame = pd.DataFrame({'Close': [50., 55.]}, index=pd.to_datetime(['2026-09-01', '2026-09-02']))
+            ticker = Mock()
+            ticker.history.return_value = frame
+            with patch.object(forecast_tracking.yf, 'Ticker', return_value=ticker), \
+                 patch.object(forecast_tracking, 'completed_bars', side_effect=lambda f, s: f):
+                history = forecast_tracking.t1_history(conn, 'TEST', unique_targets=True)
+            self.assertEqual(history[0]['status'], 'complete')
+            self.assertAlmostEqual(history[0]['actual'], 110.)
+            self.assertIsNotNone(history[0]['evaluated_at'])
+            self.assertTrue(history[0]['models']['lstm']['direction_correct'])
+            self.assertAlmostEqual(conn.execute('SELECT t1_actual_close FROM analysis_log').fetchone()[0], 110.)
 
 
 if __name__ == '__main__':

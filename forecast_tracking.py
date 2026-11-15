@@ -68,7 +68,7 @@ def t1_history(connection, name, unique_targets=False):
                 actual=actual/base_close*row['last_close']
                 stamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 connection.execute('UPDATE analysis_log SET t1_actual_close=?,t1_evaluated_at=? WHERE id=? AND t1_actual_close IS NULL',(actual,stamp,row['id']))
-                row['t1_actual_close']=actual;row['_status']='complete'
+                row['t1_actual_close']=actual;row['t1_evaluated_at']=stamp;row['_status']='complete'
             connection.commit()
         except Exception:
             connection.rollback()
@@ -86,7 +86,7 @@ def t1_history(connection, name, unique_targets=False):
                 sign=lambda v:(v>0)-(v<0)
                 direction=sign(pred-base)==sign(actual-base)
             models[key]={'prediction':pred,'error':error,'error_pct':error/actual*100 if error is not None and actual else None,'direction_correct':direction}
-        output.append({'analysis_id':row['id'],'saved_at':row['timestamp'],'data_date':row.get('data_date'),'target_date':row.get('target_t1'),'status':row['_status'],'actual':actual,'reference_close':row.get('last_close'),'models':models})
+        output.append({'analysis_id':row['id'],'saved_at':row['timestamp'],'data_date':row.get('data_date'),'target_date':row.get('target_t1'),'status':row['_status'],'actual':actual,'evaluated_at':row.get('t1_evaluated_at'),'reference_close':row.get('last_close'),'models':models})
     return output
 
 

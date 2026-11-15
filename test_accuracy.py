@@ -1,9 +1,21 @@
 """Regression checks without loading ML models or calling Ollama."""
 import unittest
+import ast
+from datetime import datetime, time as clock_time
+from pathlib import Path
+from zoneinfo import ZoneInfo
+import numpy as np
 import pandas as pd
-from trading_dates import prediction_dates, completed_bars, saved_before_open
+from trading_dates import prediction_dates, completed_bars, saved_before_open, forecast_validity, calendar_for, local_date
 
 class AccuracyTests(unittest.TestCase):
+    def test_forecast_validity_latest_close_and_target_open(self):
+        check = lambda base, target, now: forecast_validity(base, target, 'NVDA', now)[0]
+        self.assertTrue(check('2026-09-04', '2026-09-08', '2026-09-08 13:29:59+00:00'))
+        self.assertFalse(check('2026-09-04', '2026-09-08', '2026-09-08 13:30:00+00:00'))
+        self.assertFalse(check('2026-09-03', '2026-09-04', '2026-09-08 12:00+00:00'))
+        self.assertFalse(check('2026-09-04', '2026-09-09', '2026-09-08 12:00+00:00'))
+        self.assertTrue(forecast_validity('2026-11-27', '2026-11-30', 'NVDA', '2026-11-27 18:01+00:00')[0])
     def test_saved_time_uses_exchange_open_and_utc(self):
         self.assertTrue(saved_before_open('2026-09-02 08:59:00', None, '2026-09-02', '005930.KS'))
         self.assertFalse(saved_before_open('2026-09-02 09:00:00', None, '2026-09-02', '005930.KS'))
@@ -21,5 +33,25 @@ class AccuracyTests(unittest.TestCase):
         early=pd.DataFrame({'Close':[1]},index=pd.to_datetime(['2026-11-27']))
         self.assertEqual(len(completed_bars(early,'NVDA','2026-11-27 12:59-05:00')),0)
         self.assertEqual(len(completed_bars(early,'NVDA','2026-11-27 13:01-05:00')),1)
+
+    def test_macro_alignment_uses_early_close_and_market_timezones(self):
+        tree = ast.parse(Path(__file__).with_name('ml_stock.py').read_text(encoding='utf-8'))
+        agent = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'StockAIAgentV3')
+        methods = [n for n in agent.body if isinstance(n, ast.FunctionDef) and
+                   n.name in ('_close_times_utc', '_session_close_times_utc', '_merge_confirmed_macro')]
+        cls = ast.ClassDef(name='Macro', bases=[], keywords=[], body=methods, decorator_list=[])
+        namespace = {'pd': pd, 'np': np, 'datetime': datetime, 'clock_time': clock_time,
+                     'ZoneInfo': ZoneInfo, 'calendar_for': calendar_for, 'local_date': local_date}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), 'macro', 'exec'), namespace)
+        macro = namespace['Macro']
+        early = pd.to_datetime(['2026-11-27'])
+        self.assertEqual(str(macro._session_close_times_utc(early, 'NVDA')[0]), '2026-11-27 18:00:00+00:00')
+        stocks = pd.DataFrame(index=early)
+        fx = pd.Series([1300., 1400.], index=pd.to_datetime(['2026-11-26', '2026-11-27']))
+        sox = pd.Series([5000., 5100.], index=pd.to_datetime(['2026-11-25', '2026-11-27']))
+        self.assertEqual(macro._merge_confirmed_macro(stocks, fx, 'NVDA', 'USD_KRW').iloc[0], 1300.)
+        self.assertEqual(macro._merge_confirmed_macro(stocks, sox, 'NVDA', 'SOX_Index').iloc[0], 5100.)
+        kr = pd.DataFrame(index=pd.to_datetime(['2026-11-27']))
+        self.assertEqual(macro._merge_confirmed_macro(kr, sox, '005930.KS', 'SOX_Index').iloc[0], 5000.)
 
 if __name__=='__main__':unittest.main()

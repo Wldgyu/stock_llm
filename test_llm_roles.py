@@ -2,6 +2,7 @@
 import ast
 import math
 import os
+import re
 import json
 import time
 import uuid
@@ -17,7 +18,7 @@ TREE = ast.parse(Path(__file__).with_name('llm_stock.py').read_text(encoding='ut
 class PersonaInputTests(unittest.TestCase):
     def setUp(self):
         simulator = next(n for n in TREE.body if isinstance(n, ast.ClassDef))
-        namespace = {'os': os, 'math': math, 'Optional': Optional, 'json': json}
+        namespace = {'os': os, 'math': math, 'Optional': Optional, 'json': json, 're': re}
         exec(compile(ast.Module(body=[simulator], type_ignores=[]), 'simulator', 'exec'), namespace)
         self.sim = namespace['MarketAgentSimulator']()
         self.sim._send_request = Mock(return_value='ok')
@@ -48,7 +49,8 @@ class PersonaInputTests(unittest.TestCase):
     def test_main_call_signatures(self):
         agent_class = next(n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == 'StockAIAgentV4')
         namespace = {'StockAIAgentV3': object, 'DEFAULT_DB_PATH': '', 'Optional': Optional,
-                     'uuid': uuid, 'time': time, 'json': json}
+                     'uuid': uuid, 'time': time, 'json': json,
+                     'forecast_validity': lambda *args: (True, '')}
         exec(compile(ast.Module(body=[agent_class], type_ignores=[]), 'agent', 'exec'), namespace)
         agent = namespace['StockAIAgentV4'].__new__(namespace['StockAIAgentV4'])
         agent.pause_seconds = 0
@@ -60,7 +62,8 @@ class PersonaInputTests(unittest.TestCase):
         self.sim.run_final_decision_maker = Mock(return_value='{"source_ids": []}')
         self.sim.parse_response = Mock(side_effect=[('stock failed', None), ('stock failed', None), ('news report', .2), ('final report', 0.)])
         agent.save_persona_result = Mock()
-        result = agent._discuss_stock('TEST', {'analysis_id': 42, 'news_sources': [{'id': 'N1'}, {'id': 'N2'}]})
+        result = agent._discuss_stock('TEST', {'analysis_id': 42, 'data_date': '2026-09-01',
+            'target_t1': '2026-09-02', 'symbol': 'TEST', 'news_sources': [{'id': 'N1'}, {'id': 'N2'}]})
         self.assertEqual(self.sim.run_stock_expert.call_count, 2)
         self.sim.run_news_expert.assert_called_once_with('TEST', 'NEWS')
         self.sim.run_final_decision_maker.assert_called_once_with('TEST', 'stock failed', None, 'news report', .2)
@@ -72,9 +75,26 @@ class PersonaInputTests(unittest.TestCase):
         self.assertEqual(saved[-1].args[-1], 'partial')
         self.assertEqual(self.sim.parse_response.call_args.kwargs['allowed_ids'], {'N1'})
 
+    def test_expired_forecast_stops_even_if_llm_call_crosses_open(self):
+        agent_class = next(n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == 'StockAIAgentV4')
+        validity = Mock(side_effect=[(True, ''), (True, ''), (False, '개장됨')])
+        namespace = {'StockAIAgentV3': object, 'DEFAULT_DB_PATH': '', 'Optional': Optional,
+                     'uuid': uuid, 'time': time, 'json': json, 'forecast_validity': validity}
+        exec(compile(ast.Module(body=[agent_class], type_ignores=[]), 'agent', 'exec'), namespace)
+        agent = namespace['StockAIAgentV4'].__new__(namespace['StockAIAgentV4'])
+        agent._stock_context = Mock(return_value=('PRICE', 'PREDICTION'))
+        agent._news_context = Mock(return_value='NEWS')
+        agent.simulator = self.sim
+        agent.simulator.run_stock_expert = Mock(return_value='response')
+        agent.save_persona_result = Mock()
+        data = {'data_date': '2026-09-01', 'target_t1': '2026-09-02', 'symbol': 'NVDA', 'news_sources': []}
+        with self.assertRaisesRegex(ValueError, '개장됨'):
+            agent._discuss_stock('TEST', data)
+        agent.save_persona_result.assert_not_called()
+
     def test_invalid_scores_remain_failures(self):
         value = {'summary': '요약', 'evidence': '근거', 'risks': '위험',
-                 'judgment': '판단', 'source_ids': ['N1'], 'score': 0.3}
+                 'judgment': '판단 이유', 'source_ids': ['N1'], 'action': 'buy', 'score': 0.3}
         encoded = json.dumps(value, ensure_ascii=False)
         opinion, score = self.sim.parse_response(encoded, allowed_ids={'N1'})
         self.assertEqual(score, .3)
@@ -83,6 +103,17 @@ class PersonaInputTests(unittest.TestCase):
             self.assertIsNone(self.sim.parse_response(json.dumps(dict(value, score=bad_score)), allowed_ids={'N1'})[1])
         for bad in (encoded + ' trailing', encoded[:-1] + ',"score":0.4}', json.dumps(dict(value, source_ids=['N2']))):
             self.assertIsNone(self.sim.parse_response(bad, allowed_ids={'N1'})[1])
+
+    def test_direction_and_missing_evidence_are_enforced(self):
+        value = {'summary': '요약', 'evidence': '근거', 'risks': '위험',
+                 'judgment': '판단 이유', 'source_ids': ['N1'], 'action': 'buy', 'score': 0.3}
+        parse = lambda v, **kw: self.sim.parse_response(json.dumps(v), allowed_ids={'N1'}, **kw)[1]
+        self.assertIsNone(parse(dict(value, action='sell')))
+        self.assertIsNone(parse(dict(value, judgment='매도할 것을 권합니다')))
+        self.assertIsNone(parse(value, require_hold=True))
+        self.assertIsNone(parse(dict(value, source_ids=[]), require_source=True))
+        self.assertEqual(parse(dict(value, action='hold', score=0, source_ids=[]),
+                               require_hold=True, require_source=True), 0)
 
     def test_validation_omits_bulk_backtest(self):
         agent = next(n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == 'StockAIAgentV4')
