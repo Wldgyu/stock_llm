@@ -6,10 +6,19 @@ from trading_dates import calendar_for, completed_bars, saved_before_open
 
 
 def t1_history(connection, name, unique_targets=False):
+    return forecast_history(connection, name, 1, unique_targets)
+
+
+def forecast_history(connection, name, horizon, unique_targets=False):
+    if horizon not in (1, 4, 7):
+        raise ValueError('지원 기간은 1, 4, 7 거래일입니다.')
+    prefix = f't{horizon}'
+    actual_field = f'{prefix}_actual_close'
+    evaluated_field = f'{prefix}_evaluated_at'
     columns={r[1] for r in connection.execute('PRAGMA table_info(analysis_log)')}
-    if 'target_t1' not in columns:
+    if f'target_{prefix}' not in columns:
         return []
-    for field,kind in [('t1_actual_close','REAL'),('t1_evaluated_at','TEXT')]:
+    for field,kind in [(actual_field,'REAL'),(evaluated_field,'TEXT')]:
         if field not in columns:
             connection.execute(f'ALTER TABLE analysis_log ADD COLUMN {field} {kind}')
     connection.commit()
@@ -21,20 +30,20 @@ def t1_history(connection, name, unique_targets=False):
     pending=[]
     results=[]
     for row in rows:
-        target=row.get('target_t1'); base=row.get('data_date')
+        target=row.get(f'target_{prefix}'); base=row.get('data_date')
         status='untracked'
         if target and base:
             schedule=calendar.schedule(start_date=target,end_date=target)
             if schedule.empty:
                 status='invalid_date'
             else:
-                pre_open=saved_before_open(row.get('timestamp'), row.get('timestamp_utc'), target, symbol,
-                                           market_open=schedule['market_open'].iloc[0])
+                pre_open=saved_before_open(row.get('timestamp'), row.get('timestamp_utc'), row.get('target_t1'), symbol,
+                                           market_open=schedule['market_open'].iloc[0] if horizon == 1 else None)
                 if pre_open is None:
                     status='invalid_date'
                 elif not pre_open:
                     status='late'
-                elif row.get('t1_actual_close') is not None:
+                elif row.get(actual_field) is not None:
                     status='complete'
                 elif now<schedule['market_close'].iloc[0]:
                     status='pending'
@@ -48,8 +57,8 @@ def t1_history(connection, name, unique_targets=False):
             if row['_status'] in ('late', 'untracked', 'invalid_date'):
                 continue
             # Sorted newest first: never select retrospectively by prediction accuracy.
-            selected.setdefault(row['target_t1'], row)
-        results = sorted(selected.values(), key=lambda r: r['target_t1'], reverse=True)[:30]
+            selected.setdefault(row[f'target_{prefix}'], row)
+        results = sorted(selected.values(), key=lambda r: r[f'target_{prefix}'], reverse=True)[:30]
     else:
         results = results[:30]
     selected_ids = {r['id'] for r in results}
@@ -57,18 +66,18 @@ def t1_history(connection, name, unique_targets=False):
     if pending:
         try:
             start=min(r['data_date'] for r in pending)
-            end=(pd.Timestamp(max(r['target_t1'] for r in pending))+pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+            end=(pd.Timestamp(max(r[f'target_{prefix}'] for r in pending))+pd.Timedelta(days=1)).strftime('%Y-%m-%d')
             frame=yf.Ticker(symbol).history(start=start,end=end,auto_adjust=True)
             frame=completed_bars(frame,symbol)
             closes={str(i.date()):float(v) for i,v in frame['Close'].items() if pd.notna(v)}
             for row in pending:
-                actual=closes.get(row['target_t1']);base_close=closes.get(row['data_date'])
+                actual=closes.get(row[f'target_{prefix}']);base_close=closes.get(row['data_date'])
                 if actual is None or not base_close or not row.get('last_close'):continue
                 # Normalize later-adjusted history to the original forecast price basis.
                 actual=actual/base_close*row['last_close']
                 stamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                connection.execute('UPDATE analysis_log SET t1_actual_close=?,t1_evaluated_at=? WHERE id=? AND t1_actual_close IS NULL',(actual,stamp,row['id']))
-                row['t1_actual_close']=actual;row['t1_evaluated_at']=stamp;row['_status']='complete'
+                connection.execute(f'UPDATE analysis_log SET {actual_field}=?,{evaluated_field}=? WHERE id=? AND {actual_field} IS NULL',(actual,stamp,row['id']))
+                row[actual_field]=actual;row[evaluated_field]=stamp;row['_status']='complete'
             connection.commit()
         except Exception:
             connection.rollback()
@@ -76,18 +85,33 @@ def t1_history(connection, name, unique_targets=False):
                 row['_status']='fetch_failed'
     output=[]
     for row in results:
-        actual=row.get('t1_actual_close') if row['_status']=='complete' else None
-        models={}
-        for key in ('lstm','tabpfn'):
-            pred=row.get(key+'_t1');base=row.get('last_close')
-            error=pred-actual if pred is not None and actual is not None else None
-            direction=None
-            if error is not None and base is not None:
-                sign=lambda v:(v>0)-(v<0)
-                direction=sign(pred-base)==sign(actual-base)
-            models[key]={'prediction':pred,'error':error,'error_pct':error/actual*100 if error is not None and actual else None,'direction_correct':direction}
-        output.append({'analysis_id':row['id'],'saved_at':row['timestamp'],'data_date':row.get('data_date'),'target_date':row.get('target_t1'),'status':row['_status'],'actual':actual,'evaluated_at':row.get('t1_evaluated_at'),'reference_close':row.get('last_close'),'models':models})
+        actual=row.get(actual_field) if row['_status']=='complete' else None
+        base = row.get('last_close')
+        models = {
+            model: _score_prediction(row.get(f'{model}_{prefix}'), actual, base)
+            for model in ('lstm', 'tabpfn')
+        }
+        output.append({
+            'analysis_id': row['id'], 'saved_at': row['timestamp'],
+            'data_date': row.get('data_date'), 'target_date': row.get(f'target_{prefix}'),
+            'status': row['_status'], 'actual': actual, 'evaluated_at': row.get(evaluated_field),
+            'reference_close': base, 'models': models,
+        })
     return output
+
+
+def _score_prediction(prediction, actual, base):
+    error = None if prediction is None or actual is None else prediction - actual
+    correct = None
+    if error is not None and base is not None:
+        def sign(value):
+            return (value > 0) - (value < 0)
+        correct = sign(prediction - base) == sign(actual - base)
+    return {
+        'prediction': prediction, 'error': error,
+        'error_pct': error / actual * 100 if error is not None and actual else None,
+        'direction_correct': correct,
+    }
 
 
 def realized_summary(history, minimum_samples=20):

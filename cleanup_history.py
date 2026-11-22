@@ -23,6 +23,11 @@ def cleanup_history(db_path, days=30, apply=False, now=None):
         for id_,name,ts in ml:
             latest[name] = max(id_,latest.get(name,0))
         protected = set(latest.values())
+        columns = {row[1] for row in conn.execute('PRAGMA table_info(analysis_log)')}
+        if 'target_t1' in columns:
+            protected.update(row[0] for row in conn.execute(
+                'SELECT id FROM analysis_log WHERE target_t1 IS NOT NULL'
+            ))
         persons=[]
         linked=False
         if 'persona_discussion_log' in tables:

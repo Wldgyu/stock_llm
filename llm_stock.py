@@ -152,7 +152,7 @@ class MarketAgentSimulator:
             return f"{score:+.2f}" if score is not None else "분석 실패"
         return self._run_persona(
             "최종결정자",
-            "두 전문가 의견만 종합하세요. 점수를 단순 평균하지 말고 근거와 한계를 평가하세요. "
+            "두 전문가 의견만 종합하세요. evidence에는 ML 검증 결과와 기사에서 확인된 사실을 구분하고 risks에는 근거 충돌, 제목만 확보한 경우, 표본 부족을 명시하세요. 점수를 단순 평균하지 말고 근거와 한계를 평가하세요. "
             "분석 실패를 중립 의견으로 취급하거나 원문을 직접 확인한 것처럼 쓰지 마세요. "
             "전문가 분석이 실패하거나 인용된 기사가 없으면 action은 hold입니다. "
             "제공된 기사 ID만 근거에 사용하고 source_ids에 넣으세요.",

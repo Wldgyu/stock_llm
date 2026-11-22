@@ -318,7 +318,7 @@ class StockAIAgentV3:
         news_articles = self.get_financial_news_articles(name, symbol)
         news_sources = [
             {"id": f"N{i}", **{key: article.get(key, "") for key in
-             ("title", "source", "published", "url", "content_type")}}
+             ("title", "source", "published", "url", "content_type", "body")}}
             for i, article in enumerate(news_articles, 1)
         ]
         if not news_sources:
@@ -333,6 +333,12 @@ class StockAIAgentV3:
         comparison = compare_strategies(
             df, {key: value["oos_t1_predictions"] for key, value in model_metrics.items()}
         )
+        higher_costs = compare_strategies(
+            df, {key: value["oos_t1_predictions"] for key, value in model_metrics.items()},
+            fee_bps=20, slippage_bps=10,
+        )
+        for key, strategy in comparison["strategies"].items():
+            strategy["double_cost_return_pct"] = higher_costs["strategies"][key]["return_pct"]
         comparison["data_date"] = str(df.index[-1].date())
         for value in model_metrics.values():
             value["strategy_backtest"] = comparison
@@ -1126,6 +1132,15 @@ class StockAIAgentV3:
         return final_preds, final_model, last_seq, baseline_seq, metrics
 
     # ── TabPFN 예측 ───────────────────────────
+    @staticmethod
+    def _tabpfn_prices(features, targets, inputs):
+        predictions = []
+        for target in targets.T:
+            regressor = TabPFNRegressor()
+            regressor.fit(features, target)
+            predictions.append(regressor.predict(inputs))
+        return np.column_stack(predictions)
+
     def predict_tabpfn(self, df: pd.DataFrame):
         """
         시간순 3-fold walk-forward로 TabPFN의 성능을 검증합니다.
@@ -1176,6 +1191,7 @@ class StockAIAgentV3:
             fold_results = []
             all_test_true, all_test_pred, all_naive_pred = [], [], []
             oos_predictions = {}
+            return_target_predictions = []
 
             for fold_number, (test_start, test_end) in enumerate(
                 fold_boundaries, 1
@@ -1196,13 +1212,11 @@ class StockAIAgentV3:
                 X_test = all_X[test_indices]
                 y_test = all_y[test_indices]
                 naive_pred = all_naive[test_indices]
-                test_predictions = np.zeros_like(y_test)
-
-                # fold 시작 전 데이터만 학습하고 이후 구간을 순서대로 평가합니다.
-                for horizon in range(3):
-                    reg = TabPFNRegressor()
-                    reg.fit(X_train, y_train[:, horizon])
-                    test_predictions[:, horizon] = reg.predict(X_test)
+                test_predictions = self._tabpfn_prices(X_train, y_train, X_test)
+                # 같은 데이터에서 정답만 수익률로 바꾸고 다시 가격으로 환산합니다.
+                train_returns = y_train / all_naive[train_indices] - 1
+                predicted_returns = self._tabpfn_prices(X_train, train_returns, X_test)
+                return_target_predictions.append(naive_pred * (1 + predicted_returns))
 
                 oos_predictions.update({
                     str(tdf.index[target_first_indices[idx]].date()): float(pred)
@@ -1235,6 +1249,10 @@ class StockAIAgentV3:
                 oos_predictions=oos_predictions,
             )
 
+            metrics["return_target_test"] = self._regression_metrics(
+                np.concatenate(all_test_true), np.concatenate(return_target_predictions),
+                np.concatenate(all_naive_pred),
+            )
             # 최종 예측 모델은 검증이 끝난 뒤 전체 과거 데이터를 사용합니다.
             latest_window = (
                 tdf[feat_cols].iloc[-look_back:].values
@@ -1243,11 +1261,7 @@ class StockAIAgentV3:
             )
             X_arr = all_X[-max_samples:]
             y_arr = all_y[-max_samples:]
-            final_predictions = []
-            for horizon in range(3):
-                reg = TabPFNRegressor()
-                reg.fit(X_arr, y_arr[:, horizon])
-                final_predictions.append(float(reg.predict(latest_window)[0]))
+            final_predictions = self._tabpfn_prices(X_arr, y_arr, latest_window)[0].tolist()
 
             return final_predictions, metrics
 

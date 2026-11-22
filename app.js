@@ -441,7 +441,7 @@ function renderModelValidation(payload, currency) {
                 const result = test.by_horizon?.[horizon] || {};
                 const base = naive.by_horizon?.[horizon] || {};
                 const verdict = isNumber(result.mae) && isNumber(base.mae) ? (Number(result.mae) < Number(base.mae) ? "기준 대비 개선" : "기준 미달 또는 동일") : "비교 불가";
-                return `<span>${horizon}: MAE ${formatPrice(result.mae, currency)} · naive ${formatPrice(base.mae, currency)} · 방향 ${formatPercent(result.direction_accuracy)} · ${verdict}</span>`;
+                return `<span>${horizon}: MAE ${formatPrice(result.mae, currency)} · naive ${formatPrice(base.mae, currency)} · MAPE ${formatPercent(result.mape)} · 기준 대비 개선율 ${formatSignedPercent(comparison.by_horizon?.[horizon]?.mae_improvement_pct)} · 방향 ${formatPercent(result.direction_accuracy)} · 표본 ${metrics.test_samples ?? '—'}건 · ${verdict}${metrics.return_target_test ? ` · 수익률 학습 후 환산 MAE ${formatPrice(metrics.return_target_test.by_horizon[horizon].mae, currency)}` : ""}</span>`;
               }).join("")}
             </div>
             ${metrics.strategy_backtest ? `
@@ -450,7 +450,7 @@ function renderModelValidation(payload, currency) {
                 <span>${escapeHtml(metrics.strategy_backtest.start)} ~ ${escapeHtml(metrics.strategy_backtest.end)}</span>
                 <span>T+1 예측 기반 포지션 유지 · 다음 시가 체결 · 매수/현금 · 편도 수수료 ${formatNumber(metrics.strategy_backtest.fee_bps_per_side, 0)}bp + 슬리피지 ${formatNumber(metrics.strategy_backtest.slippage_bps_per_side, 0)}bp · 세금 제외</span>
                 <span>보유 중 야간 가격 변동도 수익률에 포함됩니다. 예측 정확도와 전략 수익은 다릅니다.</span>
-                ${Object.entries(metrics.strategy_backtest.strategies).map(([name, result]) => `<span>${escapeHtml(name)}: 수익률 ${formatSignedPercent(result.return_pct)} · Sharpe ${formatNumber(result.sharpe, 2)} · MDD ${formatPercent(result.mdd_pct)} · 주문 ${result.orders}회</span>`).join("")}
+                ${Object.entries(metrics.strategy_backtest.strategies).map(([name, result]) => `<span>${escapeHtml(name)}: 수익률 ${formatSignedPercent(result.return_pct)} · Sharpe ${formatNumber(result.sharpe, 2)} · MDD ${formatPercent(result.mdd_pct)} · 주문 ${result.orders}회 · 비용 2배 수익률 ${formatSignedPercent(result.double_cost_return_pct)} · 매수일 평균 시가 갭 ${formatSignedPercent(result.mean_entry_gap_pct)}</span>`).join("")}
               </div>` : ""}
             <div class="fold-summary">
               <strong>3-fold 평균 ± 표준편차</strong>
@@ -771,33 +771,23 @@ async function openAiPanel() {
     const statusLabel = { complete: "정상", partial: "일부 분석 실패 · 결과 해석 주의", failed: "최종 분석 실패" }[data.status] || "상태 확인 불가";
     const summary = final ? `
       <div class="final-decision-summary">
-        <strong class="final-summary-score" style="color:${scoreColor(final.score)}">${final.score == null ? "오류" : `${Number(final.score) >= 0 ? "+" : ""}${Number(final.score).toFixed(2)}`}</strong>
         <div class="final-summary-info">
-          <span class="final-summary-label">최종 판단 · ${statusLabel}</span>
-          <strong class="final-summary-verdict" style="color:${scoreColor(final.score)}">${scoreLabel(final.score)}</strong>
+          <strong>종합 근거와 위험</strong>
+          <span>${statusLabel} · ${escapeHtml(scoreLabel(final.score))}</span>
         </div>
         <p class="final-summary-opinion">${escapeHtml(final.opinion || "")}</p>
       </div>` : "";
 
     const cards = personas.map((persona) => {
-      const hasScore = persona.score != null;
-      const score = hasScore ? Number(persona.score) : 0;
-      const percent = ((score + 1) / 2) * 100;
-      const gauge = hasScore ? `
-        <div class="score-gauge">
-          <span class="score-gauge-center"></span>
-          <span class="score-gauge-fill" style="left:${score >= 0 ? 50 : percent}%;width:${Math.abs(percent - 50)}%;background:${score >= 0 ? "#00e5a0" : "#ff4d6d"}"></span>
-        </div>` : "";
       return `
         <article class="persona-card">
           <div class="persona-header">
             <span class="persona-name"><span class="persona-icon">${personaIcon(persona.persona)}</span>${escapeHtml(persona.persona)}</span>
-            <span class="persona-score-wrap">
-              <strong class="persona-score" style="color:${scoreColor(persona.score)}">${hasScore ? `${score >= 0 ? "+" : ""}${score.toFixed(2)}` : "—"}</strong>
+            <span class="persona-score-wrap" title="전문가 의견 점수이며 적중 확률이 아닙니다">
+              <strong class="persona-score" style="color:${scoreColor(persona.score)}">${persona.score == null ? "—" : Number(persona.score).toFixed(2)}</strong>
               <span class="persona-signal" style="color:${scoreColor(persona.score)}">${escapeHtml(persona.signal)}</span>
             </span>
           </div>
-          ${gauge}
           <p class="persona-opinion">${escapeHtml(persona.opinion || "의견 없음")}</p>
         </article>`;
     }).join("");
@@ -872,18 +862,21 @@ window.addEventListener("beforeunload", () => {
 
 async function loadT1History(name, requestId, currency) {
   const container = $("t1-realized-results");
-  container.textContent = "T+1 실제 종가 확인 중…";
+  const selector = $("forecast-horizon");
+  const horizon = selector.value;
+  selector.onchange = () => loadT1History(name, requestId, currency);
+  container.textContent = `T+${horizon} 실제 종가 확인 중…`;
   try {
-    const data = await fetchJson(`${API}/api/stock/${encodeURIComponent(name)}/t1-history`);
-    if (requestId !== state.requestId) return;
+    const data = await fetchJson(`${API}/api/stock/${encodeURIComponent(name)}/t1-history?horizon=${horizon}`);
+    if (requestId !== state.requestId || selector.value !== horizon) return;
     const labels = {complete:"평가 완료",pending:"장 마감 대기",awaiting_data:"종가 제공 대기",fetch_failed:"종가 조회 실패 · 다시 열어 재시도",late:"개장 이후 저장 · 평가 제외",untracked:"과거 기록 · 목표일 없음",invalid_date:"목표일 확인 필요"};
     const rows = data.history || [];
-    container.innerHTML = `<h4>T+1 예측과 이후 실제 종가</h4><p>최근 분석 30건 · 목표일 개장 전에 저장한 예측만 평가합니다. 오차는 예측가 − 실제 종가입니다. 실제 종가는 예측 당시 조정 가격 기준으로 환산합니다.</p>
+    container.innerHTML = `<h4>T+${horizon} 예측과 이후 실제 종가</h4><p>최근 목표일 30개 · T+1 개장 전에 저장한 예측만 평가합니다. 오차는 예측가 − 실제 종가입니다. 실제 종가는 예측 당시 조정 가격 기준으로 환산합니다.</p>
       <div class="t1-table-scroll"><table class="t1-history-table"><thead><tr><th>저장 시각</th><th>목표일</th><th>모델</th><th>예측가</th><th>실제 종가</th><th>오차 / 오차율</th><th>방향</th><th>상태</th></tr></thead><tbody>${rows.map(row => Object.entries(row.models).map(([key,m])=>`<tr>
       <td>${escapeHtml(row.saved_at)}</td><td>${escapeHtml(row.target_date || "—")}</td><td>${key === "lstm" ? "LSTM" : "TabPFN"}</td>
       <td>${formatPrice(m.prediction,currency)}</td><td>${formatPrice(row.actual,currency)}</td><td>${m.error == null ? "—" : `${formatPrice(m.error,currency)} / ${formatNumber(m.error_pct)}%`}</td>
       <td>${m.direction_correct == null ? "—" : m.direction_correct ? "적중" : "불일치"}</td><td>${m.prediction == null ? "예측 없음" : escapeHtml(labels[row.status] || row.status)}</td></tr>`).join("")).join("")}</tbody></table></div>${rows.length ? "" : "<p>저장된 예측 기록이 없습니다.</p>"}`;
   } catch (error) {
-    if (requestId === state.requestId) container.textContent = `T+1 비교 조회 실패: ${error.message}`;
+    if (requestId === state.requestId && selector.value === horizon) container.textContent = `T+${horizon} 비교 조회 실패: ${error.message}`;
   }
 }

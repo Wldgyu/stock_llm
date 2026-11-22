@@ -658,12 +658,15 @@ def api_stock_detail(name):
 
 @app.route("/api/stock/<string:name>/t1-history")
 def api_t1_history(name):
-    from forecast_tracking import t1_history
+    from forecast_tracking import forecast_history
+    horizon = request.args.get('horizon', default='1')
+    if horizon not in ('1', '4', '7'):
+        return jsonify({'error': '지원하지 않는 예측 기간'}), 400
     connection = get_connection()
     try:
         if not table_exists(connection, "analysis_log"):
             return jsonify({"history": []})
-        return jsonify({"history": t1_history(connection, name)})
+        return jsonify({"history": forecast_history(connection, name, int(horizon), unique_targets=True)})
     finally:
         connection.close()
 

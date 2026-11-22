@@ -31,6 +31,7 @@ def compare_strategies(frame, predictions, entry_threshold=0.005, fee_bps=10, sl
     for name in [*predictions, 'rsi', 'buy_hold']:
         cash, shares = 1.0, 0.0
         equity, trades = [1.0], []
+        entry_gaps = []
         for i in range(start, end + 1):
             day = keys[i]
             previous = frame.iloc[i - 1]
@@ -58,6 +59,7 @@ def compare_strategies(frame, predictions, entry_threshold=0.005, fee_bps=10, sl
             else:
                 desired = True
             if desired and shares == 0:
+                entry_gaps.append((float(row['Open']) / float(previous['Close']) - 1) * 100)
                 price = float(row['Open']) * (1 + slip)
                 shares = cash / (price * (1 + fee))
                 cash = 0.0
@@ -80,6 +82,7 @@ def compare_strategies(frame, predictions, entry_threshold=0.005, fee_bps=10, sl
             'return_pct': float((values[-1] - 1) * 100),
             'sharpe': float(np.sqrt(252) * returns.mean() / std) if std > 1e-12 else 0.0,
             'mdd_pct': float((values / np.maximum.accumulate(values) - 1).min() * 100),
+            'mean_entry_gap_pct': float(np.mean(entry_gaps)) if entry_gaps else None,
             'orders': len(trades), 'trades': trades,
             'equity': [float(v) for v in equity],
         }
