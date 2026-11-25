@@ -9,6 +9,14 @@ def t1_history(connection, name, unique_targets=False):
     return forecast_history(connection, name, 1, unique_targets)
 
 
+def evaluate_all_horizons(connection, name, unique_targets=True):
+    """지원하는 모든 예측 기간(T+1, T+4, T+7)의 실제 종가를 평가·갱신하고 결과를 반환합니다."""
+    return {
+        horizon: forecast_history(connection, name, horizon, unique_targets=unique_targets)
+        for horizon in (1, 4, 7)
+    }
+
+
 def forecast_history(connection, name, horizon, unique_targets=False):
     if horizon not in (1, 4, 7):
         raise ValueError('지원 기간은 1, 4, 7 거래일입니다.')
@@ -37,8 +45,15 @@ def forecast_history(connection, name, horizon, unique_targets=False):
             if schedule.empty:
                 status='invalid_date'
             else:
-                pre_open=saved_before_open(row.get('timestamp'), row.get('timestamp_utc'), row.get('target_t1'), symbol,
-                                           market_open=schedule['market_open'].iloc[0] if horizon == 1 else None)
+                open_target = row.get('target_t1') or target
+                open_time = schedule['market_open'].iloc[0] if open_target == target else None
+                pre_open = saved_before_open(
+                    row.get('timestamp'),
+                    row.get('timestamp_utc'),
+                    open_target,
+                    symbol,
+                    market_open=open_time,
+                )
                 if pre_open is None:
                     status='invalid_date'
                 elif not pre_open:
@@ -154,8 +169,9 @@ def realized_summary(history, minimum_samples=20):
     return summary
 
 
-def realized_summary_for_llm(connection, name):
-    history = t1_history(connection, name, unique_targets=True)
+def realized_summary_for_llm(connection, name, history=None):
+    if history is None:
+        history = t1_history(connection, name, unique_targets=True)
     summary = realized_summary(history)
     # User preference: ML versus news, not LSTM versus TabPFN.
     ml_weight, news_weight = 40, 60
@@ -165,10 +181,25 @@ def realized_summary_for_llm(connection, name):
             ml_weight, news_weight = 50, 50
         elif all(result['mae'] > result['naive_mae'] for result in model_results):
             ml_weight, news_weight = 30, 70
-    text = ['실제 사전 예측 성과(T+1): 목표일 개장 전 저장된 최신 1건만 사용, 최대 최근 30개 목표일.',
-            '중복 실행·개장 후 저장은 제외. 평가 대기는 틀린 예측으로 세지 않음.',
-            '비중 기준은 운영용 휴리스틱이며 검증된 확률/자동 학습이 아님. 최소 20개 완료 목표일, naive 대비 MAE 10% 이상 개선 및 방향 50% 이상일 때만 제한적 상향 검토.',
-            f"평가 대기/조회 미완료 목표일: {sum(r['status'] != 'complete' for r in history)}개"]
+    pending_count = sum(r['status'] != 'complete' for r in history)
+    failed_count = sum(r['status'] == 'fetch_failed' for r in history)
+    evaluated = [r['evaluated_at'] for r in history if r.get('evaluated_at')]
+    latest_eval = max(evaluated) if evaluated else '없음'
+    dir_parts = []
+    for label, key in (('LSTM', 'lstm'), ('TabPFN', 'tabpfn')):
+        res = summary[key]
+        if not res['samples']:
+            dir_parts.append(f'{label} 평가 0건')
+        else:
+            dir_parts.append(f"{label} 방향 적중 {res['direction_accuracy'] / 100:.0%} ({res['samples']}건)")
+    text = [
+        '실제 사전 T+1 예측: ' + ', '.join(dir_parts)
+        + f'. 미평가 {pending_count}건(조회 실패 {failed_count}건), 최근 평가 시각 {latest_eval}. 소표본은 참고용.',
+        '실제 사전 예측 성과(T+1): 목표일 개장 전 저장된 최신 1건만 사용, 최대 최근 30개 목표일.',
+        '중복 실행·개장 후 저장은 제외. 평가 대기는 틀린 예측으로 세지 않음.',
+        '비중 기준은 운영용 휴리스틱이며 검증된 확률/자동 학습이 아님. 최소 20개 완료 목표일, naive 대비 MAE 10% 이상 개선 및 방향 50% 이상일 때만 제한적 상향 검토.',
+        f'평가 대기/조회 미완료 목표일: {pending_count}개',
+    ]
     for key, result in summary.items():
         if not result['samples']:
             text.append(f'{key}: 평가 완료 0건, 평가 불가. 예측 비중 상향 금지.')

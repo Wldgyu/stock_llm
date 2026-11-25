@@ -24,7 +24,7 @@ load_dotenv(Path(__file__).with_name(".env"))
 # ml_stock.py 에서 공통 유틸 및 V3 에이전트 import
 from ml_stock import StockAIAgentV3
 from trading_dates import saved_before_open, forecast_validity
-from forecast_tracking import t1_history
+from forecast_tracking import t1_history, realized_summary_for_llm, evaluate_all_horizons
 
 class MarketAgentSimulator:
     """Ollama 전문가 호출과 응답 파싱."""
@@ -400,10 +400,16 @@ class StockAIAgentV4(StockAIAgentV3):
         return current, prediction_info
 
     def _realized_t1_context(self, name):
-        """평가 가능한 사전 예측을 갱신한 뒤 실제 방향 성과를 읽습니다."""
+        """평가 가능한 사전 예측을 갱신한 뒤 실제 방향 성과와 비중 가이드를 읽습니다."""
         try:
             with closing(connect_db(self.db_path, row_factory=True)) as conn:
-                history = t1_history(conn, name, unique_targets=True)
+                if "evaluate_all_horizons" in globals():
+                    histories = evaluate_all_horizons(conn, name, unique_targets=True)
+                    history = histories.get(1, [])
+                else:
+                    history = t1_history(conn, name, unique_targets=True)
+                if "realized_summary_for_llm" in globals():
+                    return realized_summary_for_llm(conn, name, history=history)
         except Exception as exc:
             print(f"      ⚠️ 실제 T+1 성과 조회 실패: {exc}")
             return "실제 T+1 방향 성과: 조회 불가"
@@ -434,8 +440,10 @@ class StockAIAgentV4(StockAIAgentV3):
 
         ensure_fresh()
         current, prediction = self._stock_context(data)
-        if self.simulator.analysis_mode == "professional":
-            prediction += "\n" + self._realized_t1_context(name)
+        if getattr(self, "db_path", None) and hasattr(self, "_realized_t1_context"):
+            realized_ctx = self._realized_t1_context(name)
+            if realized_ctx:
+                prediction += "\n" + realized_ctx
         news = self._news_context(data)
         allowed_ids = {source["id"] for source in data.get("news_sources", [])}
         run_id = uuid.uuid4().hex

@@ -18,6 +18,7 @@ import pandas as pd
 from datetime import datetime
 
 from database import DB_PATH, connect_db, table_exists
+from delete_sqlite import delete_failed_records, fetch_failed_records
 
 
 # ──────────────────────────────────────────────
@@ -176,21 +177,14 @@ def clean_failed_logs(confirm: bool = False):
     print(f"{'='*65}")
 
     conn = get_connection()
-    cursor = conn.cursor()
     try:
         if not table_exists(conn, "persona_discussion_log"):
             print("⚠️  persona_discussion_log 테이블이 없습니다.")
             return
 
-        cursor.execute(
-            """
-            DELETE FROM persona_discussion_log
-            WHERE score IS NULL OR opinion LIKE '분석 실패:%'
-               OR opinion = '분석 실패' OR opinion IS NULL OR TRIM(opinion) = ''
-            """
-        )
-        conn.commit()
-        print(f"✅ 삭제 완료! 총 {cursor.rowcount}개의 실패 로그가 정리되었습니다.")
+        failed_ids = [row[0] for row in fetch_failed_records(conn)]
+        deleted_count = delete_failed_records(conn, failed_ids)
+        print(f"✅ 삭제 완료! 총 {deleted_count}개의 실패 로그가 정리되었습니다.")
     finally:
         conn.close()
 

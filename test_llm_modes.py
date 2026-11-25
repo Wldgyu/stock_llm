@@ -149,6 +149,36 @@ class ModeTests(unittest.TestCase):
             self.assertTrue(history[0]['models']['lstm']['direction_correct'])
             self.assertAlmostEqual(conn.execute('SELECT t1_actual_close FROM analysis_log').fetchone()[0], 110.)
 
+    def test_evaluate_all_horizons_and_realized_summary_for_llm(self):
+        with sqlite3.connect(':memory:') as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute('CREATE TABLE analysis_log (id INTEGER PRIMARY KEY, name TEXT, timestamp TEXT, '
+                         'timestamp_utc TEXT, target_t1 TEXT, target_t4 TEXT, target_t7 TEXT, '
+                         'last_close REAL, lstm_t1 REAL, lstm_t4 REAL, lstm_t7 REAL, '
+                         'tabpfn_t1 REAL, tabpfn_t4 REAL, tabpfn_t7 REAL, symbol TEXT, data_date TEXT)')
+            conn.execute('INSERT INTO analysis_log VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                         ('TEST', '2026-09-01 10:00', None, '2026-09-02', '2026-09-08', '2026-09-11',
+                          100., 105., 108., 112., 98., 101., 104., 'NVDA', '2026-09-01'))
+            frame = pd.DataFrame(
+                {'Close': [100., 104., 106., 109.]},
+                index=pd.to_datetime(['2026-09-01', '2026-09-02', '2026-09-08', '2026-09-11']),
+            )
+            ticker = Mock()
+            ticker.history.return_value = frame
+            with patch.object(forecast_tracking.yf, 'Ticker', return_value=ticker), \
+                 patch.object(forecast_tracking, 'completed_bars', side_effect=lambda f, s: f):
+                histories = forecast_tracking.evaluate_all_horizons(conn, 'TEST', unique_targets=True)
+                summary_text = forecast_tracking.realized_summary_for_llm(conn, 'TEST', history=histories[1])
+            self.assertEqual(histories[1][0]['status'], 'complete')
+            self.assertEqual(histories[4][0]['status'], 'complete')
+            self.assertEqual(histories[7][0]['status'], 'complete')
+            row = conn.execute('SELECT t1_actual_close, t4_actual_close, t7_actual_close FROM analysis_log').fetchone()
+            self.assertAlmostEqual(row[0], 104.)
+            self.assertAlmostEqual(row[1], 106.)
+            self.assertAlmostEqual(row[2], 109.)
+            self.assertIn('판단 근거 참고 비중: ML 예측 40% : 뉴스 60%', summary_text)
+            self.assertIn('LSTM 방향 적중 100% (1건)', summary_text)
+
 
 if __name__ == '__main__':
     unittest.main()

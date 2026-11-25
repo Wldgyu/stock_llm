@@ -4,6 +4,7 @@ import os
 import shutil
 import sqlite3
 from pathlib import Path
+from typing import Optional
 
 
 PROJECT_DIR = Path(__file__).parent
@@ -30,6 +31,21 @@ def _prepare_database_path(db_path):
     ):
         shutil.copy2(LEGACY_DB_PATH, path)
     return path
+
+
+def archive_legacy_workspace_db() -> Optional[Path]:
+    """
+    로컬 데이터 폴더(DB_PATH)가 활성화된 상태에서 워크스페이스 루트에 구버전
+    stock_analysis.db가 남아 있으면 .legacy_backup으로 이름을 바꿔 혼선을 방지합니다.
+    """
+    active = Path(DB_PATH).resolve()
+    legacy = LEGACY_DB_PATH.resolve()
+    if active != legacy and active.exists() and legacy.exists():
+        backup = LEGACY_DB_PATH.with_name("stock_analysis.db.legacy_backup")
+        if not backup.exists():
+            LEGACY_DB_PATH.rename(backup)
+            return backup
+    return None
 
 
 def connect_db(db_path=None, row_factory=False):

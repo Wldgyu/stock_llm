@@ -54,4 +54,50 @@ class AccuracyTests(unittest.TestCase):
         kr = pd.DataFrame(index=pd.to_datetime(['2026-11-27']))
         self.assertEqual(macro._merge_confirmed_macro(kr, sox, '005930.KS', 'SOX_Index').iloc[0], 5000.)
 
+    def test_sequence_and_tabpfn_window_normalization_are_scale_invariant(self):
+        tree = ast.parse(Path(__file__).with_name('ml_stock.py').read_text(encoding='utf-8'))
+        agent = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'StockAIAgentV3')
+        methods = [n for n in agent.body if isinstance(n, ast.FunctionDef) and
+                   n.name in ('_horizon_targets', '_horizon_returns', '_returns_to_prices',
+                              '_normalize_sequence_windows', '_normalize_tabpfn_window', '_clean_rss_summary')]
+        cls = ast.ClassDef(name='NormHelper', bases=[], keywords=[], body=methods, decorator_list=[])
+        from html import unescape
+        import re
+        namespace = {'np': np, 'unescape': unescape, 're': re}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), 'norm', 'exec'), namespace)
+        helper = namespace['NormHelper']
+
+        base_seq = np.array([[100., 1300., 5000.], [110., 1313., 5050.], [121., 1326.13, 5100.5]], dtype=np.float32)
+        scaled_seq = base_seq * 10.0
+        np.testing.assert_allclose(
+            helper._normalize_sequence_windows(base_seq, 3),
+            helper._normalize_sequence_windows(scaled_seq, 3),
+            atol=1e-5,
+        )
+        np.testing.assert_allclose(helper._normalize_sequence_windows(base_seq, 3)[0, -1, :], 0.0, atol=1e-6)
+
+        tab_win = np.array([
+            [100., 1300., 5000., 30., 98., 1000.],
+            [110., 1310., 5100., 70., 105., 2000.],
+        ], dtype=np.float64)
+        tab_win_scaled = tab_win.copy()
+        tab_win_scaled[:, [0, 1, 2, 4, 5]] *= 50.0
+        np.testing.assert_allclose(
+            helper._normalize_tabpfn_window(tab_win),
+            helper._normalize_tabpfn_window(tab_win_scaled),
+            atol=1e-5,
+        )
+
+        prices = np.array([100., 102., 103., 104., 105., 106., 107., 110.])
+        rets = helper._horizon_returns(prices, 0, 1)
+        restored = helper._returns_to_prices(100., rets)
+        np.testing.assert_allclose(restored, [102., 105., 110.], atol=1e-6)
+
+        entry = {
+            'title': 'Samsung chip packaging expansion to spur $30 billion investment',
+            'summary': '<p>Samsung chip packaging expansion to spur $30 billion investment - Reuters reported that new advanced packaging lines will be built in South Korea by 2027.</p>',
+        }
+        summary = helper._clean_rss_summary(entry)
+        self.assertIn('Reuters reported that new advanced packaging lines', summary)
+
 if __name__=='__main__':unittest.main()

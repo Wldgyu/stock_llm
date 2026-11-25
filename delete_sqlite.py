@@ -21,16 +21,21 @@ from datetime import datetime
 from database import DB_PATH, connect_db, table_exists
 
 
+FAILED_RECORD_WHERE = """
+    score IS NULL
+    OR opinion LIKE '분석 실패:%'
+    OR opinion = '분석 실패'
+    OR opinion IS NULL
+    OR TRIM(opinion) = ''
+"""
+
+
 # ── 실패 레코드 조회 ─────────────────────────────────
 def fetch_failed_records(conn):
-    query = """
+    query = f"""
         SELECT id, timestamp, ticker_name, persona, opinion, score
         FROM persona_discussion_log
-        WHERE score IS NULL
-           OR opinion LIKE '분석 실패:%'
-           OR opinion = '분석 실패'
-           OR opinion IS NULL
-           OR TRIM(opinion) = ''
+        WHERE {FAILED_RECORD_WHERE}
         ORDER BY id
     """
     return conn.execute(query).fetchall()
@@ -52,11 +57,7 @@ def delete_failed_records(conn, ids):
 def print_summary(conn):
     total = conn.execute("SELECT COUNT(*) FROM persona_discussion_log").fetchone()[0]
     fail = conn.execute(
-        """
-        SELECT COUNT(*) FROM persona_discussion_log
-        WHERE score IS NULL OR opinion LIKE '분석 실패:%'
-           OR opinion = '분석 실패' OR opinion IS NULL OR TRIM(opinion) = ''
-        """
+        f"SELECT COUNT(*) FROM persona_discussion_log WHERE {FAILED_RECORD_WHERE}"
     ).fetchone()[0]
     ok = total - fail
 

@@ -8,6 +8,9 @@ COMPANIES = {
     '삼성전자': ('Samsung Electronics', ('samsung', '삼성전자')),
     '엔비디아': ('NVIDIA', ('nvidia', '엔비디아')),
     '인텔': ('Intel', ('intel', '인텔')),
+    '애플': ('Apple', ('apple', '애플')),
+    '테슬라': ('Tesla', ('tesla', '테슬라')),
+    '마이크로소프트': ('Microsoft', ('microsoft', '마이크로소프트')),
 }
 TOPICS = {
     '실적·자본정책': (3, r'\b(earnings|profit|revenue|guidance|dividend|buyback|loss|sales)\b|실적|영업이익|매출|배당|자사주'),

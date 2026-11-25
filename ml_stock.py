@@ -12,12 +12,14 @@ ml_stock.py
 
 from contextlib import closing
 from datetime import datetime, time as clock_time, timedelta, timezone
+from html import unescape
 from zoneinfo import ZoneInfo
 
 import warnings
 import traceback
 import urllib.parse
 import os
+import re
 import json
 from pathlib import Path
 
@@ -220,6 +222,12 @@ class StockAIAgentV3:
                 "target_t1": "TEXT",
                 "target_t4": "TEXT",
                 "target_t7": "TEXT",
+                "t1_actual_close": "REAL",
+                "t1_evaluated_at": "TEXT",
+                "t4_actual_close": "REAL",
+                "t4_evaluated_at": "TEXT",
+                "t7_actual_close": "REAL",
+                "t7_evaluated_at": "TEXT",
                 "lstm_t1": "REAL",
                 "lstm_t4": "REAL",
                 "lstm_t7": "REAL",
@@ -369,6 +377,12 @@ class StockAIAgentV3:
         if not valid:
             raise ValueError(f'예측 저장 중단: {reason}')
         self._save_analysis_result(name, result)
+        try:
+            from forecast_tracking import evaluate_all_horizons
+            with closing(connect_db(self.db_path, row_factory=True)) as conn:
+                evaluate_all_horizons(conn, name, unique_targets=True)
+        except Exception as exc:
+            print(f"      ⚠️ [{name}] 이전 예측 실제 종가 자동 갱신 실패: {exc}")
         print(f"✅ [{name}] ML 분석 및 DB 저장 완료.")
         return result
 
@@ -504,6 +518,28 @@ class StockAIAgentV3:
         )
         return feedparser.parse(url).entries
 
+    @staticmethod
+    def _clean_rss_summary(entry) -> str:
+        """RSS summary HTML에서 태그와 제목 중복 문구를 제거한 요약 텍스트를 추출합니다."""
+        raw_summary = getattr(entry, "summary", None) or (
+            entry.get("summary", "") if isinstance(entry, dict) else ""
+        )
+        raw_title = getattr(entry, "title", None) or (
+            entry.get("title", "") if isinstance(entry, dict) else ""
+        )
+        if not raw_summary:
+            return ""
+        cleaned = " ".join(unescape(re.sub(r"<[^>]+>", " ", str(raw_summary))).split())
+        title_clean = " ".join(unescape(str(raw_title)).split())
+        if not cleaned or cleaned.casefold() == title_clean.casefold():
+            return ""
+        if title_clean and cleaned.startswith(title_clean):
+            remainder = cleaned[len(title_clean):].lstrip(" -–—:·|")
+            if len(remainder) >= 25:
+                return remainder
+            return ""
+        return cleaned if len(cleaned) >= 25 else ""
+
     def get_news_titles(self, name: str):
         """기사 본문을 얻지 못했을 때 LLM에 전달할 뉴스 제목을 수집합니다."""
         company = COMPANIES.get(name, (name, ()))[0]
@@ -517,6 +553,8 @@ class StockAIAgentV3:
             "Wall Street Journal": ("WSJ", "The Wall Street Journal", "Wall Street Journal"),
             "Financial Times": ("Financial Times",),
             "Reuters": ("Reuters",),
+            "CNBC": ("CNBC",),
+            "Yahoo Finance": ("Yahoo Finance",),
         }
         company_query = COMPANIES.get(name, (symbol.split(".")[0], ()))[0]
         articles = []
@@ -561,6 +599,12 @@ class StockAIAgentV3:
                                     body = ""
                 except Exception as exc:
                     print(f"      ⚠️ {display_source} 본문 수집 실패: {exc}")
+
+            if not body:
+                rss_summary = self._clean_rss_summary(entry)
+                if rss_summary:
+                    body = rss_summary
+                    content_type = "기사 요약"
 
             # LLM 입력이 너무 커지지 않도록 기사당 본문 길이를 제한합니다.
             body = " ".join(body.split())[:2500]
@@ -782,17 +826,34 @@ class StockAIAgentV3:
     @staticmethod
     def _horizon_targets(values, target_first: int) -> list:
         """기준 시점으로부터 T+1, T+4, T+7 세 시점의 타겟 값을 추출합니다."""
-        if values.ndim == 2:
-            return [
-                values[target_first, 0],
-                values[target_first + 3, 0],
-                values[target_first + 6, 0],
-            ]
-        return [
-            float(values[target_first]),
-            float(values[target_first + 3]),
-            float(values[target_first + 6]),
-        ]
+        array = values[:, 0] if getattr(values, "ndim", 1) == 2 else values
+        return [float(array[target_first + offset]) for offset in (0, 3, 6)]
+
+    @staticmethod
+    def _horizon_returns(prices, base_index: int, target_first: int) -> list:
+        """기준 시점 종가(base_index) 대비 T+1, T+4, T+7 누적 수익률을 추출합니다."""
+        base = max(float(prices[base_index]), 1e-8)
+        return [float(prices[target_first + offset]) / base - 1.0 for offset in (0, 3, 6)]
+
+    @staticmethod
+    def _returns_to_prices(base_prices, predicted_returns) -> np.ndarray:
+        """예측 수익률 배열을 기준 종가(base_prices) 기반 예측 주가로 환산합니다."""
+        base = np.asarray(base_prices, dtype=np.float64)
+        returns = np.asarray(predicted_returns, dtype=np.float64)
+        if base.ndim == 1 and returns.ndim == 2:
+            base = base[:, None]
+        return base * (1.0 + returns)
+
+    @staticmethod
+    def _normalize_sequence_windows(data: np.ndarray, seq_len: int) -> np.ndarray:
+        """시퀀스 내 각 피처를 윈도우 마지막 시점(seq_len-1) 대비 상대 변화율로 변환합니다."""
+        windows = np.lib.stride_tricks.sliding_window_view(
+            data, window_shape=seq_len, axis=0
+        ).transpose(0, 2, 1)
+        anchors = np.where(
+            np.abs(windows[:, -1:, :]) < 1e-8, 1e-8, windows[:, -1:, :]
+        )
+        return ((windows / anchors) - 1.0).astype(np.float32)
 
     def _to_tensor(self, array) -> torch.Tensor:
         """numpy 배열 리스트를 학습 디바이스의 float32 텐서로 변환합니다."""
@@ -878,11 +939,18 @@ class StockAIAgentV3:
         return metrics
 
     # 최대 100 epoch 안에서 검증 손실이 개선되지 않으면 조기 종료합니다.
-    def _train_lstm(self, X_train, y_train, X_val=None, y_val=None, max_epochs=None):
+    def _train_lstm(
+        self, X_train, y_train, X_val=None, y_val=None, max_epochs=None, seed: int = 42
+    ):
         """LSTM을 학습하고 검증 손실이 개선되지 않으면 일찍 종료합니다."""
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
         max_epochs = max_epochs or self.LSTM_MAX_EPOCHS
         # ── 직접 조정하기 쉬운 LSTM 학습 설정 ──
-        learning_rate = 0.005  # 학습률: 불안정하면 낮추고, 너무 느리면 조금 높입니다.
+        learning_rate = 0.003  # 수익률 스케일에서 안정적으로 수렴하도록 학습률 조정
         batch_size = 16        # 배치 크기: 작을수록 세밀하지만 학습 시간이 늘어납니다.
         dropout_rate = 0.2     # 과적합 조절: 과적합이 크면 값을 조금 높입니다.
         huber_delta = 1.0      # 이상치 민감도: 작을수록 급등락의 영향을 덜 받습니다.
@@ -890,13 +958,15 @@ class StockAIAgentV3:
         patience = 12          # 조기 종료: 검증 손실 개선을 기다리는 epoch 수입니다.
 
         model = LSTMModel(
-            input_dim=3,
+            input_dim=X_train.size(-1),
             hidden_dim=self.LSTM_HIDDEN_SIZE,
             num_layers=self.LSTM_NUM_LAYERS,
             output_dim=3,
             dropout=dropout_rate,
         ).to(self.device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=learning_rate, weight_decay=1e-4
+        )
         # Huber 손실은 급등락 같은 이상치가 학습을 과도하게 흔드는 것을 줄입니다.
         criterion = nn.HuberLoss(delta=huber_delta)
         best_state = None
@@ -944,18 +1014,97 @@ class StockAIAgentV3:
             model.load_state_dict(best_state)
         return model, best_epoch
 
+    @staticmethod
+    def _build_lstm_dataset(data: np.ndarray, seq_len: int):
+        """전체 시계열에서 윈도우별 상대 변화율 입력과 기준가 대비 미래 수익률 타겟을 구성합니다."""
+        all_windows = StockAIAgentV3._normalize_sequence_windows(data, seq_len)
+        close_prices = data[:, 0].astype(np.float64)
+        sample_count = len(data) - seq_len - 6
+        if sample_count <= 0:
+            raise ValueError("LSTM 시퀀스를 구성하기에 데이터가 부족합니다.")
+
+        X_windows = all_windows[:sample_count]
+        target_first = np.arange(seq_len, seq_len + sample_count)
+        target_last = target_first + 6
+        base_closes = close_prices[target_first - 1]
+        y_prices = np.column_stack([
+            close_prices[target_first + offset] for offset in (0, 3, 6)
+        ])
+        safe_base = np.where(np.abs(base_closes) < 1e-8, 1e-8, base_closes)[:, None]
+        y_returns = ((y_prices / safe_base) - 1.0).astype(np.float32)
+        naive_prices = np.repeat(base_closes[:, None], 3, axis=1)
+        return {
+            "X_windows": X_windows,
+            "y_returns": y_returns,
+            "y_prices": y_prices,
+            "naive_prices": naive_prices,
+            "base_closes": base_closes,
+            "target_first": target_first,
+            "target_last": target_last,
+            "latest_window": all_windows[-1],
+        }
+
+    def _fit_and_predict_lstm_split(
+        self,
+        X_windows: np.ndarray,
+        y_returns: np.ndarray,
+        train_idx: np.ndarray,
+        val_idx: np.ndarray = None,
+        eval_windows: np.ndarray = None,
+        max_epochs: int = None,
+        seed: int = 42,
+    ):
+        """학습 구간 기준으로만 피처와 수익률 타겟을 표준화해 LSTM을 학습하고 예측 수익률을 복원합니다."""
+        n_feat = X_windows.shape[-1]
+        feat_scaler = StandardScaler()
+        feat_scaler.fit(X_windows[train_idx].reshape(-1, n_feat))
+        scale_X = lambda arr: feat_scaler.transform(
+            arr.reshape(-1, n_feat)
+        ).reshape(arr.shape).astype(np.float32)
+
+        target_scaler = StandardScaler()
+        y_train_scaled = target_scaler.fit_transform(y_returns[train_idx]).astype(np.float32)
+
+        X_train_t = self._to_tensor(scale_X(X_windows[train_idx]))
+        y_train_t = self._to_tensor(y_train_scaled)
+        X_val_t, y_val_t = None, None
+        if val_idx is not None and len(val_idx):
+            X_val_t = self._to_tensor(scale_X(X_windows[val_idx]))
+            y_val_t = self._to_tensor(
+                target_scaler.transform(y_returns[val_idx]).astype(np.float32)
+            )
+
+        model, best_epoch = self._train_lstm(
+            X_train_t, y_train_t, X_val_t, y_val_t, max_epochs=max_epochs, seed=seed
+        )
+        pred_returns = None
+        eval_tensor = None
+        if eval_windows is not None:
+            eval_tensor = self._to_tensor(scale_X(eval_windows))
+            model.eval()
+            with torch.no_grad():
+                pred_scaled = model(eval_tensor).cpu().numpy()
+            pred_returns = target_scaler.inverse_transform(pred_scaled)
+        return model, best_epoch, pred_returns, X_train_t, eval_tensor
+
     # ── LSTM 예측 ─────────────────────────────
     def predict_multi_step(self, df: pd.DataFrame):
         """
         시간순 3-fold walk-forward로 LSTM의 T+1, T+4, T+7을 검증합니다.
-        각 fold는 직전 종가를 그대로 예측하는 naive baseline과 비교합니다.
-        검증이 끝나면 전체 데이터로 최종 모델을 다시 학습해 미래를 예측합니다.
+        윈도우 끝점 대비 상대 변화율 피처와 기준 종가 대비 누적 수익률 타겟을 학습해
+        주가 레벨 이동(Non-stationarity)에 따른 평균 회귀 왜곡을 방지합니다.
         """
-        np.random.seed(42)
-        torch.manual_seed(42)
-
         data = df[['Close', 'USD_KRW', 'SOX_Index']].values.astype(np.float32)
         seq_len = self.LSTM_SEQUENCE_LENGTH
+        dataset = self._build_lstm_dataset(data, seq_len)
+        X_windows = dataset["X_windows"]
+        y_returns = dataset["y_returns"]
+        y_prices = dataset["y_prices"]
+        naive_prices = dataset["naive_prices"]
+        base_closes = dataset["base_closes"]
+        target_first = dataset["target_first"]
+        target_last = dataset["target_last"]
+
         fold_boundaries = self._walk_forward_boundaries(
             len(data), self.WALK_FORWARD_FOLDS
         )
@@ -964,6 +1113,7 @@ class StockAIAgentV3:
         oos_predictions = {}
         all_val_true, all_val_pred = [], []
         all_test_true, all_test_pred, all_naive_pred = [], [], []
+        min_retrain_epochs = 5
 
         for fold_number, (test_start, test_end) in enumerate(fold_boundaries, 1):
             # 각 fold 학습 구간의 마지막 15%는 조기 종료 검증에만 사용합니다.
@@ -971,101 +1121,46 @@ class StockAIAgentV3:
             if val_start <= seq_len + 7 or test_end - test_start < 8:
                 raise ValueError("LSTM walk-forward 분리에 필요한 데이터가 부족합니다.")
 
-            # fold마다 학습 구간 데이터로만 스케일러를 다시 맞춰 누수를 막습니다.
-            scaler = StandardScaler()
-            scaler.fit(data[:val_start])
-            scaled = scaler.transform(data)
-            split_X = {"train": [], "val": []}
-            split_y = {"train": [], "val": []}
-
-            for start in range(len(scaled) - seq_len - 6):
-                target_first = start + seq_len
-                target_last = target_first + 6
-                if target_last < val_start:
-                    split = "train"
-                elif target_first >= val_start and target_last < test_start:
-                    split = "val"
-                else:
-                    # fold 경계에 걸친 정답은 다른 구간 정보가 섞이지 않도록 제외합니다.
-                    continue
-
-                split_X[split].append(scaled[start:start + seq_len])
-                split_y[split].append(self._horizon_targets(scaled, target_first))
-
-            if any(not split_X[name] for name in ("train", "val")):
+            train_idx = np.flatnonzero(target_last < val_start)
+            val_idx = np.flatnonzero(
+                (target_first >= val_start) & (target_last < test_start)
+            )
+            full_train_idx = np.flatnonzero(target_last < test_start)
+            test_idx = np.flatnonzero(
+                (target_first >= test_start) & (target_last < test_end)
+            )
+            if any(len(idx) == 0 for idx in (train_idx, val_idx, full_train_idx, test_idx)):
                 raise ValueError(
                     f"LSTM walk-forward fold {fold_number}에 빈 구간이 있습니다."
                 )
 
-            X_train = self._to_tensor(split_X["train"])
-            y_train = self._to_tensor(split_y["train"])
-            X_val = self._to_tensor(split_X["val"])
-            y_val = self._to_tensor(split_y["val"])
-
-            eval_model, fold_best_epoch = self._train_lstm(
-                X_train, y_train, X_val, y_val
+            _, fold_best_epoch, val_pred_returns, _, _ = self._fit_and_predict_lstm_split(
+                X_windows,
+                y_returns,
+                train_idx=train_idx,
+                val_idx=val_idx,
+                eval_windows=X_windows[val_idx],
+                seed=42 + fold_number,
             )
             best_epochs.append(fold_best_epoch)
-            eval_model.eval()
-            with torch.no_grad():
-                val_pred_scaled = eval_model(X_val).cpu().numpy()
+            val_true = y_prices[val_idx]
+            val_pred = self._returns_to_prices(base_closes[val_idx], val_pred_returns)
 
-            close_scale = scaler.scale_[0]
-            close_mean = scaler.mean_[0]
-            to_price = lambda values: (values * close_scale) + close_mean
-            val_true = to_price(y_val.cpu().numpy())
-            val_pred = to_price(val_pred_scaled)
-
-            # 선택한 epoch로 테스트 직전까지의 모든 과거 데이터를 다시 학습합니다.
-            full_scaler = StandardScaler()
-            full_scaler.fit(data[:test_start])
-            full_scaled = full_scaler.transform(data)
-            full_train_X, full_train_y = [], []
-            full_test_X, full_test_y, full_test_naive = [], [], []
-            test_dates = []
-            for start in range(len(full_scaled) - seq_len - 6):
-                target_first = start + seq_len
-                target_last = target_first + 6
-                features = full_scaled[start:start + seq_len]
-                targets = self._horizon_targets(full_scaled, target_first)
-                if target_last < test_start:
-                    full_train_X.append(features)
-                    full_train_y.append(targets)
-                elif target_first >= test_start and target_last < test_end:
-                    test_dates.append(str(df.index[target_first].date()))
-                    full_test_X.append(features)
-                    full_test_y.append(targets)
-                    last_close = float(data[target_first - 1, 0])
-                    full_test_naive.append([last_close, last_close, last_close])
-
-            if not full_train_X or not full_test_X:
-                raise ValueError(
-                    f"LSTM walk-forward fold {fold_number} 재학습 구간이 비었습니다."
-                )
-
-            full_train_X_t = self._to_tensor(full_train_X)
-            full_train_y_t = self._to_tensor(full_train_y)
-            full_test_X_t = self._to_tensor(full_test_X)
-            full_test_y_t = self._to_tensor(full_test_y)
-            fold_model, _ = self._train_lstm(
-                full_train_X_t,
-                full_train_y_t,
-                max_epochs=max(1, fold_best_epoch),
+            # 전체 fold 학습 구간(85% -> 100%) 재학습 시 최소 epoch 하한과 독립 시드를 보장합니다.
+            retrain_epochs = max(min_retrain_epochs, fold_best_epoch)
+            _, _, test_pred_returns, _, _ = self._fit_and_predict_lstm_split(
+                X_windows,
+                y_returns,
+                train_idx=full_train_idx,
+                eval_windows=X_windows[test_idx],
+                max_epochs=retrain_epochs,
+                seed=100 + fold_number,
             )
-            fold_model.eval()
-            with torch.no_grad():
-                test_pred_scaled = fold_model(full_test_X_t).cpu().numpy()
-
-            full_close_scale = full_scaler.scale_[0]
-            full_close_mean = full_scaler.mean_[0]
-            test_true = (
-                full_test_y_t.cpu().numpy() * full_close_scale
-            ) + full_close_mean
-            test_pred = (
-                test_pred_scaled * full_close_scale
-            ) + full_close_mean
+            test_true = y_prices[test_idx]
+            test_pred = self._returns_to_prices(base_closes[test_idx], test_pred_returns)
+            naive_pred = naive_prices[test_idx]
+            test_dates = [str(df.index[idx].date()) for idx in target_first[test_idx]]
             oos_predictions.update(zip(test_dates, map(float, test_pred[:, 0])))
-            naive_pred = np.asarray(full_test_naive, dtype=np.float64)
 
             fold_results.append(
                 self._build_fold_result(
@@ -1076,9 +1171,9 @@ class StockAIAgentV3:
                     test_pred=test_pred,
                     naive_pred=naive_pred,
                     samples={
-                        "train": len(full_train_X_t),
-                        "val": len(split_X["val"]),
-                        "test": len(full_test_X_t),
+                        "train": int(len(full_train_idx)),
+                        "val": int(len(val_idx)),
+                        "test": int(len(test_idx)),
                     },
                     best_epoch=fold_best_epoch,
                     val_true=val_true,
@@ -1091,7 +1186,7 @@ class StockAIAgentV3:
             all_test_pred.append(test_pred)
             all_naive_pred.append(naive_pred)
 
-        best_epoch = max(1, int(round(float(np.median(best_epochs)))))
+        best_epoch = max(min_retrain_epochs, int(round(float(np.median(best_epochs)))))
         metrics = self._build_walk_forward_metrics(
             model_name="LSTM",
             fold_results=fold_results,
@@ -1104,36 +1199,41 @@ class StockAIAgentV3:
             best_epoch=best_epoch,
         )
 
-        # 실제 미래 예측은 최신 정보까지 활용하도록 전체 데이터로 다시 학습합니다.
-        final_scaler = StandardScaler()
-        final_scaled = final_scaler.fit_transform(data)
-        final_X, final_y = [], []
-        for start in range(len(final_scaled) - seq_len - 6):
-            target = start + seq_len
-            final_X.append(final_scaled[start:start + seq_len])
-            final_y.append(self._horizon_targets(final_scaled, target))
-        X_all = self._to_tensor(final_X)
-        y_all = self._to_tensor(final_y)
-        final_model, _ = self._train_lstm(
-            X_all, y_all, max_epochs=max(1, best_epoch)
-        )
+        # 실제 미래 예측은 최신 정보까지 활용하되 최근 15% 검증 구간으로 조기 종료를 함께 적용합니다.
+        all_indices = np.arange(len(X_windows))
+        final_val_cutoff = int(len(data) * 0.85)
+        final_train_idx = np.flatnonzero(target_last < final_val_cutoff)
+        final_val_idx = np.flatnonzero(target_first >= final_val_cutoff)
+        if len(final_train_idx) > 0 and len(final_val_idx) > 0:
+            _, tuned_epoch, _, _, _ = self._fit_and_predict_lstm_split(
+                X_windows,
+                y_returns,
+                train_idx=final_train_idx,
+                val_idx=final_val_idx,
+                seed=200,
+            )
+            final_epochs = max(min_retrain_epochs, int(round((best_epoch + tuned_epoch) / 2)))
+        else:
+            final_epochs = best_epoch
 
-        final_model.eval()
-        last_seq = torch.tensor(
-            final_scaled[-seq_len:], dtype=torch.float32, device=self.device
-        ).unsqueeze(0)
-        with torch.no_grad():
-            preds_scaled = final_model(last_seq).cpu().numpy()[0]
-        final_preds = (
-            preds_scaled * final_scaler.scale_[0] + final_scaler.mean_[0]
-        ).astype(float).tolist()
+        latest_window = dataset["latest_window"][None, ...]
+        final_model, _, final_pred_returns, X_all, last_seq = self._fit_and_predict_lstm_split(
+            X_windows,
+            y_returns,
+            train_idx=all_indices,
+            eval_windows=latest_window,
+            max_epochs=final_epochs,
+            seed=201,
+        )
+        last_close = float(data[-1, 0])
+        final_preds = self._returns_to_prices(last_close, final_pred_returns[0]).astype(float).tolist()
         # Integrated Gradients 배경(baseline): 학습에 사용된 시퀀스들의 평균
         baseline_seq = X_all.mean(dim=0, keepdim=True).detach()
         return final_preds, final_model, last_seq, baseline_seq, metrics
 
     # ── TabPFN 예측 ───────────────────────────
     @staticmethod
-    def _tabpfn_prices(features, targets, inputs):
+    def _tabpfn_predict(features, targets, inputs):
         predictions = []
         for target in targets.T:
             regressor = TabPFNRegressor()
@@ -1141,11 +1241,32 @@ class StockAIAgentV3:
             predictions.append(regressor.predict(inputs))
         return np.column_stack(predictions)
 
+    @staticmethod
+    def _normalize_tabpfn_window(window: np.ndarray) -> np.ndarray:
+        """
+        TabPFN 입력 윈도우(look_back, 6)를 윈도우 마지막 날 기준으로 정규화합니다.
+        feat_cols 순서: ['Close', 'USD_KRW', 'SOX_Index', 'RSI', 'EMA20', 'Volume']
+        - 가격·지표·거래량(0, 1, 2, 4, 5): 마지막 시점 종가/지표 대비 상대 변화율
+          (단, EMA20은 동일 시점 Close 대비 괴리율 대신 마지막 Close 대비 비율로 통일)
+        - RSI(3): 0~100 범위를 [-0.5, 0.5]로 스케일링
+        """
+        norm = window.astype(np.float64).copy()
+        last_close = max(abs(norm[-1, 0]), 1e-8)
+        norm[:, 0] = norm[:, 0] / last_close - 1.0
+        norm[:, 4] = norm[:, 4] / last_close - 1.0
+        for col in (1, 2):
+            anchor = max(abs(norm[-1, col]), 1e-8)
+            norm[:, col] = norm[:, col] / anchor - 1.0
+        norm[:, 3] = (norm[:, 3] - 50.0) / 100.0
+        vol_mean = max(float(np.mean(np.abs(norm[:, 5]))), 1e-8)
+        norm[:, 5] = norm[:, 5] / vol_mean - 1.0
+        return norm.flatten().astype(np.float32)
+
     def predict_tabpfn(self, df: pd.DataFrame):
         """
         시간순 3-fold walk-forward로 TabPFN의 성능을 검증합니다.
-        각 fold는 직전 종가를 유지하는 naive baseline과 비교합니다.
-        T+1, T+4, T+7은 각각 별도 회귀 모델로 직접 예측합니다.
+        윈도우 내 상대 변화율 피처와 기준 종가 대비 수익률 타겟을 학습한 뒤 가격으로 환산하여
+        직전 종가를 유지하는 naive baseline과 비교합니다.
         """
         if not TABPFN_AVAILABLE:
             return None, None
@@ -1161,24 +1282,27 @@ class StockAIAgentV3:
             tdf = tdf[feat_cols].dropna()
 
             look_back = 10   # 과거 N일을 피처로 사용
+            feat_values = tdf[feat_cols].to_numpy(dtype=np.float64)
             close_values = tdf['Close'].to_numpy(dtype=np.float64)
 
-            all_X, all_y = [], []
+            all_X, all_y_prices, all_y_returns = [], [], []
             target_first_indices, target_last_indices = [], []
             all_naive = []
 
-            # 과거 10일을 입력으로 만들고 세 미래 시점의 종가를 정답으로 둡니다.
+            # 과거 10일 상대 변화율 피처를 입력으로, 기준 종가 대비 미래 수익률을 타겟으로 구성합니다.
             for i in range(look_back, len(tdf) - 6):
-                window = tdf[feat_cols].iloc[i - look_back:i].values.flatten()
+                window = self._normalize_tabpfn_window(feat_values[i - look_back:i])
                 all_X.append(window)
-                all_y.append(self._horizon_targets(close_values, i))
+                all_y_prices.append(self._horizon_targets(close_values, i))
+                all_y_returns.append(self._horizon_returns(close_values, i - 1, i))
                 target_first_indices.append(i)
                 target_last_indices.append(i + 6)
                 last_close = float(close_values[i - 1])
                 all_naive.append([last_close, last_close, last_close])
 
             all_X = np.asarray(all_X, dtype=np.float32)
-            all_y = np.asarray(all_y, dtype=np.float32)
+            all_y_prices = np.asarray(all_y_prices, dtype=np.float32)
+            all_y_returns = np.asarray(all_y_returns, dtype=np.float32)
             all_naive = np.asarray(all_naive, dtype=np.float32)
             target_first_indices = np.asarray(target_first_indices)
             target_last_indices = np.asarray(target_last_indices)
@@ -1191,7 +1315,6 @@ class StockAIAgentV3:
             fold_results = []
             all_test_true, all_test_pred, all_naive_pred = [], [], []
             oos_predictions = {}
-            return_target_predictions = []
 
             for fold_number, (test_start, test_end) in enumerate(
                 fold_boundaries, 1
@@ -1208,15 +1331,13 @@ class StockAIAgentV3:
 
                 train_indices = train_indices[-max_samples:]
                 X_train = all_X[train_indices]
-                y_train = all_y[train_indices]
+                y_train_returns = all_y_returns[train_indices]
                 X_test = all_X[test_indices]
-                y_test = all_y[test_indices]
+                y_test_prices = all_y_prices[test_indices]
                 naive_pred = all_naive[test_indices]
-                test_predictions = self._tabpfn_prices(X_train, y_train, X_test)
-                # 같은 데이터에서 정답만 수익률로 바꾸고 다시 가격으로 환산합니다.
-                train_returns = y_train / all_naive[train_indices] - 1
-                predicted_returns = self._tabpfn_prices(X_train, train_returns, X_test)
-                return_target_predictions.append(naive_pred * (1 + predicted_returns))
+
+                predicted_returns = self._tabpfn_predict(X_train, y_train_returns, X_test)
+                test_predictions = self._returns_to_prices(naive_pred, predicted_returns)
 
                 oos_predictions.update({
                     str(tdf.index[target_first_indices[idx]].date()): float(pred)
@@ -1227,7 +1348,7 @@ class StockAIAgentV3:
                         fold_number=fold_number,
                         test_start=test_start,
                         test_end=test_end,
-                        test_true=y_test,
+                        test_true=y_test_prices,
                         test_pred=test_predictions,
                         naive_pred=naive_pred,
                         samples={
@@ -1236,7 +1357,7 @@ class StockAIAgentV3:
                         },
                     )
                 )
-                all_test_true.append(y_test)
+                all_test_true.append(y_test_prices)
                 all_test_pred.append(test_predictions)
                 all_naive_pred.append(naive_pred)
 
@@ -1248,20 +1369,17 @@ class StockAIAgentV3:
                 all_naive_pred=all_naive_pred,
                 oos_predictions=oos_predictions,
             )
+            metrics["return_target_test"] = metrics["test"]
 
-            metrics["return_target_test"] = self._regression_metrics(
-                np.concatenate(all_test_true), np.concatenate(return_target_predictions),
-                np.concatenate(all_naive_pred),
-            )
             # 최종 예측 모델은 검증이 끝난 뒤 전체 과거 데이터를 사용합니다.
-            latest_window = (
-                tdf[feat_cols].iloc[-look_back:].values
-                .astype(np.float32)
-                .reshape(1, -1)
-            )
+            latest_window = self._normalize_tabpfn_window(
+                feat_values[-look_back:]
+            ).reshape(1, -1)
             X_arr = all_X[-max_samples:]
-            y_arr = all_y[-max_samples:]
-            final_predictions = self._tabpfn_prices(X_arr, y_arr, latest_window)[0].tolist()
+            y_arr = all_y_returns[-max_samples:]
+            final_returns = self._tabpfn_predict(X_arr, y_arr, latest_window)[0]
+            last_close = float(close_values[-1])
+            final_predictions = self._returns_to_prices(last_close, final_returns).astype(float).tolist()
 
             return final_predictions, metrics
 

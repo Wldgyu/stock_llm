@@ -18,7 +18,7 @@ OLLAMA_HOST=127.0.0.1
 OLLAMA_EXPERT_MODEL=gemma4:12b
 OLLAMA_DECISION_MODEL=gemma4:12b
 NVIDIA_TOKEN=your_nvidia_api_key_here
-NVIDIA_MODEL=nvidia/nemotron-3-super-120b-a12b
+NVIDIA_MODEL=nvidia/nemotron-3.5-super-vl-120b-a12b
 OLLAMA_TIMEOUT_SECONDS=600
 
 .env는 Git에서 제외됩니다. 실제 인증 키는 코드나 README에 작성하지 않습니다.
@@ -42,7 +42,7 @@ OLLAMA_EXPERT_MODEL은 두 전문가, OLLAMA_DECISION_MODEL은 최종결정자�
 
 전문 분석: NVIDIA API
 
-NVIDIA API 키를 .env의 NVIDIA_TOKEN에 입력하고 전문 분석을 선택합니다. 기본 모델은 nvidia/nemotron-3-super-120b-a12b이며 https://integrate.api.nvidia.com/v1/chat/completions로 요청합니다.
+NVIDIA API 키를 .env의 NVIDIA_TOKEN에 입력하고 전문 분석을 선택합니다. 기본 모델은 nvidia/nemotron-3.5-super-vl-120b-a12b이며 https://integrate.api.nvidia.com/v1/chat/completions로 요청합니다.
 
 전문 분석에서는 세 페르소나 모두 NVIDIA_MODEL을 사용합니다. Ollama 서버는 필요하지 않으며 역할별 가격·예측 요약 또는 뉴스 자료가 NVIDIA 서버로 전송됩니다. API 사용 가능 여부와 한도는 계정 및 서비스 조건에 따릅니다. 키 누락 시 전문 분석을 시작할 수 없고 요청 실패 시 로컬 모델로 자동 전환하지 않습니다.
 
@@ -54,7 +54,7 @@ OLLAMA_HOST | 127.0.0.1 | 간단 분석 Ollama 서버 호스트
 OLLAMA_EXPERT_MODEL | gemma4:12b | 간단 분석의 주식·뉴스 전문가 모델
 OLLAMA_DECISION_MODEL | gemma4:12b | 간단 분석의 최종결정자 모델
 NVIDIA_TOKEN | 없음 | 전문 분석 API 키
-NVIDIA_MODEL | nvidia/nemotron-3-super-120b-a12b | 전문 분석의 세 페르소나 모델
+NVIDIA_MODEL | nvidia/nemotron-3.5-super-vl-120b-a12b | 전문 분석의 세 페르소나 모델
 OLLAMA_TIMEOUT_SECONDS | 600 | Ollama와 NVIDIA 요청의 응답 대기 제한(초)
 OLLAMA_PAUSE_SECONDS | 15 | 전문가 호출 사이 대기 시간(초), 두 방식 공통
 TABPFN_TOKEN, HF_TOKEN | 없음 | ML 모델 인증 정보

@@ -3,6 +3,7 @@ __pycache__/
 
 # 로컬 데이터 및 생성 결과
 stock_analysis.db
+stock_analysis.db.*
 shap_analysis_*.png
 contribution_*.png
 
@@ -14,4 +15,5 @@ tabpfn_api.txt
 
 # 로컬 분석 파일 및 설정
 CODE_ANALYSIS.txt
+LOCAL_REFACTOR_NOTES.md
 requirements.txt
